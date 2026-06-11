@@ -95,7 +95,10 @@ else
     CUDA_MAJOR=$(echo "$CUDA_VER" | cut -d. -f1)
     CUDA_MINOR=$(echo "$CUDA_VER" | cut -d. -f2)
 
-    if [[ "$CUDA_MAJOR" -ge 12 && "$CUDA_MINOR" -ge 6 ]]; then
+    if [[ "$CUDA_MAJOR" -ge 12 && "$CUDA_MINOR" -ge 8 ]]; then
+        # CUDA 12.8+ — required for Blackwell (sm_120, RTX Pro 6000 / B200)
+        CUDA_SHORT="cu128"
+    elif [[ "$CUDA_MAJOR" -ge 12 && "$CUDA_MINOR" -ge 6 ]]; then
         CUDA_SHORT="cu126"
     elif [[ "$CUDA_MAJOR" -ge 12 && "$CUDA_MINOR" -ge 4 ]]; then
         CUDA_SHORT="cu124"
