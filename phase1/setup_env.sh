@@ -66,11 +66,12 @@ else
 fi
 
 # --------------------------------------------------------------------------
-# 3. Upgrade pip / setuptools
+# 3. Upgrade pip (setuptools pinned — torch 2.12 requires setuptools<82)
 # --------------------------------------------------------------------------
 echo ""
 echo "=== Upgrading pip + setuptools ==="
-"$PIP" install --upgrade pip setuptools wheel
+"$PIP" install --upgrade pip wheel
+"$PIP" install "setuptools>=70.0.0,<82.0.0"
 
 # --------------------------------------------------------------------------
 # 4. CUDA / PyTorch
@@ -144,11 +145,19 @@ echo "Using PyTorch index : $TORCH_INDEX"
 
 echo ""
 echo "=== Installing PyTorch ==="
+# Remove any existing torch build (e.g. cu126) — pip will not swap CUDA tags otherwise
+"$PIP" uninstall -y torch torchvision torchaudio 2>/dev/null || true
+
+TORCH_PKGS=(torch torchvision torchaudio)
 if [[ -n "$TORCH_MIN_VERSION" ]]; then
-    "$PIP" install "torch>=${TORCH_MIN_VERSION}" torchvision torchaudio --index-url "$TORCH_INDEX"
-else
-    "$PIP" install torch torchvision torchaudio --index-url "$TORCH_INDEX"
+    TORCH_PKGS=("torch>=${TORCH_MIN_VERSION}" torchvision torchaudio)
 fi
+
+"$PIP" install \
+    --force-reinstall \
+    --no-cache-dir \
+    "${TORCH_PKGS[@]}" \
+    --index-url "$TORCH_INDEX"
 
 # --------------------------------------------------------------------------
 # 5. Core ML / HF packages
@@ -185,6 +194,13 @@ import torch
 
 print(f"  torch version    : {torch.__version__}")
 print(f"  CUDA available   : {torch.cuda.is_available()}")
+
+if "+cu126" in torch.__version__ or torch.version.cuda == "12.6":
+    print("  ERROR: torch is still the cu126 build (no sm_120). Re-run:")
+    print("    pip uninstall -y torch torchvision torchaudio")
+    print("    pip install --force-reinstall --no-cache-dir torch torchvision torchaudio \\")
+    print("      --index-url https://download.pytorch.org/whl/cu130")
+    sys.exit(1)
 
 if not torch.cuda.is_available():
     print("  ERROR: No CUDA GPU visible to PyTorch. Run on a GPU machine.")
