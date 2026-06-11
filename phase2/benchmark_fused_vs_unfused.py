@@ -18,9 +18,9 @@ Two benchmark modes (mirrors benchmark_reference.py):
                 Fused path:   absorb gamma at runtime → linear_new(x) / rms(x)
                 Use this to isolate the kernel speedup without re-saving a checkpoint.
 
-Two fusion sites:
-  attn   input_layernorm → q_proj  (representative; largest attention projection)
-  moe    post_attention_layernorm → experts[0].gate_proj  (one expert, representative)
+Two fusion sites (Qwen3_5MoeDecoderLayer):
+  attn   input_layernorm → linear_attn.in_proj_qkv  OR  self_attn.q_proj
+  moe    post_attention_layernorm → gate half of mlp.experts.gate_up_proj[0]
 
 Usage
 ─────
@@ -86,6 +86,12 @@ from fusion_bf16 import (           # noqa: E402
     VARIANTS,
     build_fused_module,
 )
+from qwen3_moe_layers import (      # noqa: E402
+    attn_input_proj,
+    attn_site_label,
+    moe_gate_proj,
+    validate_decoder_layer,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -109,13 +115,6 @@ _BATCH_SEQ_PAIRS = [
     (32,  512),
     (32, 2048),
 ]
-
-# Qwen3.6-35B-A3B expected dimensions (used for documentation / validation)
-QWEN3_HIDDEN   = 4096
-QWEN3_Q_OUT    = 4096   # 32 heads × 128 head_dim
-QWEN3_KV_OUT   = 1024   # 8 KV heads × 128 head_dim
-QWEN3_MOE_OUT  = 1536   # expert intermediate size
-
 
 # ---------------------------------------------------------------------------
 # Benchmark wrapper modules (site-specific)
@@ -194,7 +193,9 @@ def _extract_layer(model: nn.Module, layer_idx: int, device: str) -> nn.Module:
     del model
     gc.collect()
     torch.cuda.empty_cache()
-    return layer.to(device=device, dtype=DTYPE).eval()
+    layer = layer.to(device=device, dtype=DTYPE).eval()
+    validate_decoder_layer(layer, layer_idx)
+    return layer
 
 
 def _get_norm_eps(norm: nn.Module) -> float:
@@ -232,31 +233,29 @@ def _build_attn_pair(
     variant: str,
 ) -> Tuple[nn.Module, nn.Module]:
     """
-    Build (unfused_bench, fused_bench) for the attention fusion site:
-      input_layernorm + q_proj
+    Build (unfused_bench, fused_bench) for the attention fusion site.
 
     mode=checkpoints  : fused_bench loads from layer_fused (gamma in weights)
     mode=runtime-patch: fused_bench absorbs gamma from layer_unfused at init
     """
-    norm_uf   = layer_unfused.input_layernorm
-    q_proj_uf = layer_unfused.self_attn.q_proj
-    eps       = _get_norm_eps(norm_uf)
+    norm_uf = layer_unfused.input_layernorm
+    proj_uf = attn_input_proj(layer_unfused)
+    eps     = _get_norm_eps(norm_uf)
 
-    unfused = _UnfusedNormLinear(norm_uf, q_proj_uf)
+    unfused = _UnfusedNormLinear(norm_uf, proj_uf)
 
     if mode == "checkpoints":
         assert layer_fused is not None, "checkpoints mode requires --fused-dir"
-        fused = _FusedLinearOnly(layer_fused.self_attn.q_proj, eps)
+        fused = _FusedLinearOnly(attn_input_proj(layer_fused), eps)
 
-    else:  # runtime-patch
-        # Absorb gamma into a copy of q_proj at runtime
-        gamma   = norm_uf.weight.detach().float()
-        q_copy  = copy.deepcopy(q_proj_uf)
+    else:  # runtime-patch — Qwen3_5MoeRMSNorm scale is (1 + weight)
+        gamma = 1.0 + norm_uf.weight.detach().float()
+        proj_copy = copy.deepcopy(proj_uf)
         with torch.no_grad():
-            q_copy.weight.copy_(
-                (q_copy.weight.detach().float() * gamma.unsqueeze(0)).to(DTYPE)
+            proj_copy.weight.copy_(
+                (proj_copy.weight.detach().float() * gamma.unsqueeze(0)).to(DTYPE)
             )
-        fused = build_fused_module(q_copy, norm_uf, variant=variant)
+        fused = build_fused_module(proj_copy, norm_uf, variant=variant)
 
     return unfused, fused
 
@@ -271,46 +270,27 @@ def _build_moe_pair(
 ) -> Tuple[nn.Module, nn.Module]:
     """
     Build (unfused_bench, fused_bench) for the MoE fusion site:
-      post_attention_layernorm + experts[expert_idx].gate_proj
-
-    Benchmarks a single expert (representative for all 128).
+      post_attention_layernorm + gate half of experts.gate_up_proj[expert_idx]
     """
-    norm_uf  = layer_unfused.post_attention_layernorm
-    eps      = _get_norm_eps(norm_uf)
-
-    # Support both MoE (experts list) and dense FFN
-    experts_uf = getattr(layer_unfused.mlp, "experts", None)
-    if experts_uf is not None and len(experts_uf) > expert_idx:
-        gate_uf = experts_uf[expert_idx].gate_proj
-    elif hasattr(layer_unfused.mlp, "gate_proj"):
-        gate_uf = layer_unfused.mlp.gate_proj
-    else:
-        raise RuntimeError(
-            "Could not find gate_proj under mlp — "
-            "check that the model is Qwen3-MoE and the layer index is valid."
-        )
+    norm_uf = layer_unfused.post_attention_layernorm
+    gate_uf = moe_gate_proj(layer_unfused, expert_idx)
+    eps     = _get_norm_eps(norm_uf)
 
     unfused = _UnfusedNormLinear(norm_uf, gate_uf)
 
     if mode == "checkpoints":
         assert layer_fused is not None, "checkpoints mode requires --fused-dir"
-        experts_f = getattr(layer_fused.mlp, "experts", None)
-        if experts_f is not None and len(experts_f) > expert_idx:
-            gate_f = experts_f[expert_idx].gate_proj
-        elif hasattr(layer_fused.mlp, "gate_proj"):
-            gate_f = layer_fused.mlp.gate_proj
-        else:
-            raise RuntimeError("Could not find gate_proj in fused layer mlp")
+        gate_f = moe_gate_proj(layer_fused, expert_idx)
         fused = _FusedLinearOnly(gate_f, eps)
 
-    else:  # runtime-patch
-        gamma    = norm_uf.weight.detach().float()
-        g_copy   = copy.deepcopy(gate_uf)
+    else:  # runtime-patch — Qwen3_5MoeRMSNorm scale is (1 + weight)
+        gamma = 1.0 + norm_uf.weight.detach().float()
+        gate_copy = copy.deepcopy(gate_uf)
         with torch.no_grad():
-            g_copy.weight.copy_(
-                (g_copy.weight.detach().float() * gamma.unsqueeze(0)).to(DTYPE)
+            gate_copy.weight.copy_(
+                (gate_copy.weight.detach().float() * gamma.unsqueeze(0)).to(DTYPE)
             )
-        fused = build_fused_module(g_copy, norm_uf, variant=variant)
+        fused = build_fused_module(gate_copy, norm_uf, variant=variant)
 
     return unfused, fused
 
@@ -318,15 +298,6 @@ def _build_moe_pair(
 # ---------------------------------------------------------------------------
 # Core benchmark loop  (reuses benchmark_reference primitives)
 # ---------------------------------------------------------------------------
-
-def _infer_hidden(module: nn.Module) -> int:
-    """Infer the input hidden dimension from the first 2-D weight."""
-    for name, p in module.named_parameters():
-        if p.ndim == 2 and "norm" not in name:
-            print(f"  Inferred hidden_dim={p.shape[1]} from '{name}' {tuple(p.shape)}")
-            return p.shape[1]
-    raise ValueError("Cannot infer hidden_dim from module — check layer path")
-
 
 def run_site_benchmark(
     unfused_bench: nn.Module,
@@ -450,21 +421,25 @@ def run_benchmark(
     print(f"\nExtracting layer {layer_idx} onto {device} ...")
     layer_uf = _extract_layer(model_unfused, layer_idx, device)
     layer_f  = _extract_layer(model_fused,  layer_idx, device) if model_fused else None
+    hidden   = layer_uf.hidden_size
+
+    print(f"\nLayer {layer_idx}: type={layer_uf.layer_type}  hidden={hidden}")
+    print(f"  Attn site: {attn_site_label(layer_uf)}")
+    print(f"  MoE site : post_attention_layernorm + mlp.experts.gate_up_proj[0] gate half")
 
     all_results: dict[str, list[ShapeResult]] = {}
 
     # ------------------------------------------------------------------
-    # Site: attn (input_layernorm → q_proj)
+    # Site: attn
     # ------------------------------------------------------------------
     if "attn" in sites:
         print(f"\n{'#' * 62}")
-        print(f"# Fusion site: attn  (input_layernorm + q_proj)")
+        print(f"# Fusion site: attn  ({attn_site_label(layer_uf)})")
         print(f"{'#' * 62}")
 
         unfused_b, fused_b = _build_attn_pair(
             layer_uf, layer_f, mode=mode, variant=variant
         )
-        hidden = _infer_hidden(unfused_b)
         site_results = run_site_benchmark(
             unfused_b, fused_b, hidden, site_label="attn", device=device
         )
@@ -475,17 +450,16 @@ def run_benchmark(
         print_summary_table(site_results)
 
     # ------------------------------------------------------------------
-    # Site: moe (post_attention_layernorm → expert gate_proj)
+    # Site: moe
     # ------------------------------------------------------------------
     if "moe" in sites:
         print(f"\n{'#' * 62}")
-        print(f"# Fusion site: moe  (post_attention_layernorm + expert[0].gate_proj)")
+        print(f"# Fusion site: moe  (post_attention_layernorm + gate_up_proj[0] gate)")
         print(f"{'#' * 62}")
 
         unfused_b, fused_b = _build_moe_pair(
             layer_uf, layer_f, mode=mode, variant=variant, expert_idx=0
         )
-        hidden = _infer_hidden(unfused_b)
         site_results = run_site_benchmark(
             unfused_b, fused_b, hidden, site_label="moe", device=device
         )
@@ -646,7 +620,8 @@ def main() -> None:
             model_f  = _load_full_model(args.fused_dir, "fused")
             layer_f  = _extract_layer(model_f, args.layer_idx, args.device)
 
-        hidden = QWEN3_HIDDEN
+        hidden = layer_uf.hidden_size
+        print(f"\nLayer {args.layer_idx}: type={layer_uf.layer_type}  hidden={hidden}")
         x = torch.randn(1, 128, hidden, device=args.device, dtype=DTYPE)
 
         for site in sites:

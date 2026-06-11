@@ -64,6 +64,12 @@ from benchmark_reference import (   # noqa: E402
     WARMUP_ITERS,
     MEASURE_ITERS,
 )
+from qwen3_moe_layers import (      # noqa: E402
+    attn_input_proj,
+    attn_site_label,
+    moe_gate_proj,
+    validate_decoder_layer,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -86,11 +92,6 @@ _BATCH_SEQ_PAIRS = [
 
 _RESULTS_DIR = _THIS_DIR / "outputs" / "benchmark_layer"
 
-# Qwen3.6-35B-A3B decoder layer types (config.layer_types, 3:1 hybrid stack)
-_LAYER_LINEAR = "linear_attention"
-_LAYER_FULL   = "full_attention"
-_DECODER_CLS  = "Qwen3_5MoeDecoderLayer"
-
 
 # ---------------------------------------------------------------------------
 # Unfused benchmark wrapper
@@ -107,26 +108,6 @@ class _UnfusedNormLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.linear(self.norm(x))
         return out[0] if isinstance(out, tuple) else out
-
-
-class _ExpertGateProj(nn.Module):
-    """
-    Gate projection for one expert in Qwen3_5MoeExperts.
-
-    Experts store gate and up weights together in gate_up_proj [E, 2*I, H];
-    the gate matrix is the first I rows for each expert.
-    """
-
-    def __init__(self, gate_up_proj: torch.Tensor, expert_idx: int):
-        super().__init__()
-        intermediate = gate_up_proj.shape[1] // 2
-        self.weight = nn.Parameter(
-            gate_up_proj[expert_idx, :intermediate, :].detach().clone(),
-            requires_grad=False,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.linear(x, self.weight)
 
 
 # ---------------------------------------------------------------------------
@@ -156,12 +137,7 @@ def _extract_layer(model: nn.Module, layer_idx: int) -> nn.Module:
     gc.collect()
     torch.cuda.empty_cache()
     layer = layer.to(device=DEVICE, dtype=DTYPE).eval()
-
-    if type(layer).__name__ != _DECODER_CLS:
-        raise TypeError(
-            f"Expected {_DECODER_CLS} at model.layers[{layer_idx}], "
-            f"got {type(layer).__name__}"
-        )
+    validate_decoder_layer(layer, layer_idx)
     return layer
 
 
@@ -169,39 +145,15 @@ def _extract_layer(model: nn.Module, layer_idx: int) -> nn.Module:
 # Build benchmark modules — Qwen3_5MoeDecoderLayer fusion sites
 # ---------------------------------------------------------------------------
 
-def _attn_input_proj(layer: nn.Module) -> nn.Module:
-    """Token-mixer input linear for this layer's hybrid attention type."""
-    if layer.layer_type == _LAYER_LINEAR:
-        return layer.linear_attn.in_proj_qkv
-    if layer.layer_type == _LAYER_FULL:
-        return layer.self_attn.q_proj
-    raise ValueError(f"Unknown layer_type={layer.layer_type!r}")
-
-
-def _moe_gate_proj(layer: nn.Module, expert_idx: int) -> nn.Module:
-    """Gate projection for one routed expert (Qwen3_5MoeExperts.gate_up_proj)."""
-    gate_up = layer.mlp.experts.gate_up_proj
-    num_experts = gate_up.shape[0]
-    if not 0 <= expert_idx < num_experts:
-        raise IndexError(f"expert_idx={expert_idx} out of range (num_experts={num_experts})")
-    return _ExpertGateProj(gate_up, expert_idx)
-
-
 def _build_attn_module(layer: nn.Module) -> _UnfusedNormLinear:
-    return _UnfusedNormLinear(layer.input_layernorm, _attn_input_proj(layer))
+    return _UnfusedNormLinear(layer.input_layernorm, attn_input_proj(layer))
 
 
 def _build_moe_module(layer: nn.Module, expert_idx: int = 0) -> _UnfusedNormLinear:
     return _UnfusedNormLinear(
         layer.post_attention_layernorm,
-        _moe_gate_proj(layer, expert_idx),
+        moe_gate_proj(layer, expert_idx),
     )
-
-
-def _attn_site_label(layer: nn.Module) -> str:
-    if layer.layer_type == _LAYER_LINEAR:
-        return "input_layernorm + linear_attn.in_proj_qkv"
-    return "input_layernorm + self_attn.q_proj"
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +308,7 @@ def main() -> None:
 
     print(f"  Layer type : {layer.layer_type}")
     print(f"  Hidden size: {hidden_size}")
-    print(f"  Attn site  : {_attn_site_label(layer)}")
+    print(f"  Attn site  : {attn_site_label(layer)}")
     print(f"  MoE site   : post_attention_layernorm + mlp.experts.gate_up_proj[0] gate half")
 
     sites = ["attn", "moe"] if args.site == "all" else [args.site]

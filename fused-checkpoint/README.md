@@ -96,13 +96,14 @@ if key in t:
 
 | Tensor | Before | After |
 |---|---|---|
-| `layers.{i}.input_layernorm.weight` | gamma values (not all 1.0) | all 1.0 |
-| `layers.{i}.self_attn.q_proj.weight` | W | W × gamma |
-| `layers.{i}.self_attn.k_proj.weight` | W | W × gamma |
-| `layers.{i}.self_attn.v_proj.weight` | W | W × gamma |
-| `layers.{i}.post_attention_layernorm.weight` | gamma values (not all 1.0) | all 1.0 |
-| `layers.{i}.mlp.experts.{j}.gate_proj.weight` | W | W × gamma |
-| `layers.{i}.mlp.experts.{j}.up_proj.weight` | W | W × gamma |
+| `layers.{i}.input_layernorm.weight` | learned scale (1 + weight) | all 0.0 |
+| `linear_attention` layers: `linear_attn.in_proj_{qkv,z,b,a}.weight` | W | W × gamma |
+| `full_attention` layers: `self_attn.{q,k,v}_proj.weight` | W | W × gamma |
+| `layers.{i}.post_attention_layernorm.weight` | learned scale (1 + weight) | all 0.0 |
+| `layers.{i}.mlp.experts.gate_up_proj` | W (gate+up fused `[E,2I,H]`) | W × gamma |
+| `layers.{i}.mlp.gate.weight` (router) | W | W × gamma |
+| `layers.{i}.mlp.shared_expert.{gate,up}_proj.weight` | W | W × gamma |
+| `layers.{i}.mlp.shared_expert_gate.weight` | W | W × gamma |
 
 All other tensors (embeddings, `o_proj`, `down_proj`, etc.) are unchanged.
 
