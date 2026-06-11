@@ -10,7 +10,7 @@
 #
 # Requirements:
 #   - Python 3.11+
-#   - CUDA 12.x driver already installed
+#   - NVIDIA driver with CUDA 12.x+ (Blackwell/sm_120 needs cu130 + torch>=2.7)
 #   - ~5 GB free disk for packages
 # =============================================================================
 
@@ -74,48 +74,81 @@ echo "=== Upgrading pip + setuptools ==="
 
 # --------------------------------------------------------------------------
 # 4. CUDA / PyTorch
-# Detect CUDA version from nvcc or nvidia-smi and pick the right torch index.
+# Blackwell (sm_100/sm_120) needs torch>=2.7 on the cu130 wheel. Do NOT pick
+# the wheel from nvcc alone — e.g. nvcc 12.9 + sm_120 still needs cu130, not cu126.
 # --------------------------------------------------------------------------
 echo ""
-echo "=== Detecting CUDA version ==="
+echo "=== Detecting GPU and PyTorch CUDA wheel ==="
 
-CUDA_VER=""
-if command -v nvcc &>/dev/null; then
-    CUDA_VER=$(nvcc --version | grep -oP 'release \K[0-9]+\.[0-9]+')
-elif command -v nvidia-smi &>/dev/null; then
-    CUDA_VER=$(nvidia-smi | grep -oP 'CUDA Version: \K[0-9]+\.[0-9]+')
-fi
+CUDA_SHORT=""
+TORCH_MIN_VERSION=""
 
-if [[ -z "$CUDA_VER" ]]; then
-    echo "WARNING: Could not detect CUDA version. Defaulting to cu124 PyTorch index."
-    CUDA_SHORT="cu124"
-else
-    echo "Detected CUDA $CUDA_VER"
-    # Map to PyTorch index tag
-    CUDA_MAJOR=$(echo "$CUDA_VER" | cut -d. -f1)
-    CUDA_MINOR=$(echo "$CUDA_VER" | cut -d. -f2)
+if command -v nvidia-smi &>/dev/null; then
+    GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)
+    COMPUTE_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 || true)
+    DRIVER_CUDA=$(nvidia-smi 2>/dev/null | grep -oP 'CUDA Version: \K[0-9]+\.[0-9]+' || true)
 
-    if [[ "$CUDA_MAJOR" -ge 12 && "$CUDA_MINOR" -ge 8 ]]; then
-        # CUDA 12.8+ — required for Blackwell (sm_120, RTX Pro 6000 / B200)
-        CUDA_SHORT="cu128"
-    elif [[ "$CUDA_MAJOR" -ge 12 && "$CUDA_MINOR" -ge 6 ]]; then
-        CUDA_SHORT="cu126"
-    elif [[ "$CUDA_MAJOR" -ge 12 && "$CUDA_MINOR" -ge 4 ]]; then
-        CUDA_SHORT="cu124"
-    elif [[ "$CUDA_MAJOR" -ge 12 && "$CUDA_MINOR" -ge 1 ]]; then
-        CUDA_SHORT="cu121"
-    else
-        echo "WARNING: CUDA < 12.1 detected. PyTorch may not support your driver fully."
-        CUDA_SHORT="cu121"
+    echo "GPU               : ${GPU_NAME:-unknown}"
+    echo "Compute capability: ${COMPUTE_CAP:-unknown}"
+    [[ -n "$DRIVER_CUDA" ]] && echo "Driver CUDA max   : $DRIVER_CUDA"
+
+    if [[ -n "$COMPUTE_CAP" ]]; then
+        CC_MAJOR=$(echo "$COMPUTE_CAP" | cut -d. -f1)
+        # sm_100 (10.0) and sm_120 (12.0) are Blackwell — cu126 tops out at sm_90
+        if [[ "$CC_MAJOR" -ge 10 ]]; then
+            CUDA_SHORT="cu130"
+            TORCH_MIN_VERSION="2.7.0"
+            echo "-> Blackwell GPU (sm_${CC_MAJOR}*): requiring PyTorch >=${TORCH_MIN_VERSION} from cu130 index"
+        fi
     fi
 fi
 
+if [[ -z "$CUDA_SHORT" ]]; then
+    CUDA_VER=""
+    if command -v nvidia-smi &>/dev/null; then
+        CUDA_VER=$(nvidia-smi 2>/dev/null | grep -oP 'CUDA Version: \K[0-9]+\.[0-9]+' || true)
+    elif command -v nvcc &>/dev/null; then
+        CUDA_VER=$(nvcc --version | grep -oP 'release \K[0-9]+\.[0-9]+')
+    fi
+
+    if [[ -z "$CUDA_VER" ]]; then
+        echo "WARNING: Could not detect CUDA version. Defaulting to cu124 PyTorch index."
+        CUDA_SHORT="cu124"
+    else
+        echo "Detected CUDA: $CUDA_VER"
+        CUDA_MAJOR=$(echo "$CUDA_VER" | cut -d. -f1)
+        CUDA_MINOR=$(echo "$CUDA_VER" | cut -d. -f2)
+
+        if [[ "$CUDA_MAJOR" -ge 13 ]]; then
+            CUDA_SHORT="cu130"
+        elif [[ "$CUDA_MAJOR" -ge 12 && "$CUDA_MINOR" -ge 8 ]]; then
+            CUDA_SHORT="cu128"
+        elif [[ "$CUDA_MAJOR" -ge 12 && "$CUDA_MINOR" -ge 6 ]]; then
+            CUDA_SHORT="cu126"
+        elif [[ "$CUDA_MAJOR" -ge 12 && "$CUDA_MINOR" -ge 4 ]]; then
+            CUDA_SHORT="cu124"
+        elif [[ "$CUDA_MAJOR" -ge 12 && "$CUDA_MINOR" -ge 1 ]]; then
+            CUDA_SHORT="cu121"
+        else
+            echo "WARNING: CUDA < 12.1 detected. PyTorch may not support your driver fully."
+            CUDA_SHORT="cu121"
+        fi
+    fi
+fi
+
+# Optional override: TORCH_CUDA=cu132 bash setup_env.sh  (experimental CUDA 13.2)
+CUDA_SHORT="${TORCH_CUDA:-$CUDA_SHORT}"
+
 TORCH_INDEX="https://download.pytorch.org/whl/${CUDA_SHORT}"
-echo "Using PyTorch index: $TORCH_INDEX"
+echo "Using PyTorch index : $TORCH_INDEX"
 
 echo ""
 echo "=== Installing PyTorch ==="
-"$PIP" install torch torchvision torchaudio --index-url "$TORCH_INDEX"
+if [[ -n "$TORCH_MIN_VERSION" ]]; then
+    "$PIP" install "torch>=${TORCH_MIN_VERSION}" torchvision torchaudio --index-url "$TORCH_INDEX"
+else
+    "$PIP" install torch torchvision torchaudio --index-url "$TORCH_INDEX"
+fi
 
 # --------------------------------------------------------------------------
 # 5. Core ML / HF packages
@@ -141,22 +174,51 @@ echo "=== Installing benchmark utilities ==="
     psutil
 
 # --------------------------------------------------------------------------
-# 7. Verify CUDA is visible to PyTorch
+# 7. Verify CUDA kernels run on this GPU (catches cu126 + sm_120 mismatch)
 # --------------------------------------------------------------------------
 echo ""
 echo "=== Verifying PyTorch + CUDA ==="
 python - <<'EOF'
+import sys
+
 import torch
+
 print(f"  torch version    : {torch.__version__}")
 print(f"  CUDA available   : {torch.cuda.is_available()}")
-if torch.cuda.is_available():
-    print(f"  CUDA version     : {torch.version.cuda}")
-    for i in range(torch.cuda.device_count()):
-        p = torch.cuda.get_device_properties(i)
-        free, total = torch.cuda.mem_get_info(i)
-        print(f"  GPU {i}: {p.name} | {total / 1024**3:.1f} GB total | {free / 1024**3:.1f} GB free")
-else:
-    print("  WARNING: No CUDA GPU found. Run on a GPU machine.")
+
+if not torch.cuda.is_available():
+    print("  ERROR: No CUDA GPU visible to PyTorch. Run on a GPU machine.")
+    sys.exit(1)
+
+print(f"  PyTorch CUDA     : {torch.version.cuda}")
+arch_list = torch.cuda.get_arch_list()
+print(f"  PyTorch arch list: {arch_list}")
+
+for i in range(torch.cuda.device_count()):
+    p = torch.cuda.get_device_properties(i)
+    major, minor = p.major, p.minor
+    sm_tag = f"sm_{major}{minor}"
+    free, total = torch.cuda.mem_get_info(i)
+    print(
+        f"  GPU {i}: {p.name} | {sm_tag} | "
+        f"{total / 1024**3:.1f} GB total | {free / 1024**3:.1f} GB free"
+    )
+    if sm_tag not in arch_list:
+        print(f"  ERROR: {sm_tag} is not in PyTorch's compiled arch list.")
+        print("  Blackwell (RTX PRO 6000 / sm_120) needs the cu130 wheel, e.g.:")
+        print("    pip install 'torch>=2.7.0' torchvision torchaudio \\")
+        print("      --index-url https://download.pytorch.org/whl/cu130")
+        sys.exit(1)
+
+try:
+    x = torch.zeros(1, device="cuda")
+    x.uniform_()
+    torch.cuda.synchronize()
+    print("  CUDA kernel test : OK")
+except Exception as exc:
+    print(f"  ERROR: CUDA kernel test failed: {exc}")
+    print("  Reinstall PyTorch from the cu130 index (see above), then re-run setup.")
+    sys.exit(1)
 EOF
 
 # --------------------------------------------------------------------------
