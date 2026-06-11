@@ -15,9 +15,13 @@ mkdir -p "$MODEL_DIR"
 
 echo "Downloading $MODEL_ID -> $MODEL_DIR"
 
-huggingface-cli download \
+if ! command -v hf >/dev/null 2>&1; then
+    echo "Error: 'hf' not found. Install with: pip install -U huggingface_hub" >&2
+    exit 1
+fi
+
+hf download \
     "$MODEL_ID" \
-    --local-dir "$MODEL_DIR" \
-    --local-dir-use-symlinks False
+    --local-dir "$MODEL_DIR"
 
 echo "Done. Model saved to $MODEL_DIR"
