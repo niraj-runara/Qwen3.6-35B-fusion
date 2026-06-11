@@ -1,0 +1,39 @@
+{
+  "prompt": "The key difference between a mixture-of-experts model and a dense model is",
+  "model_dir": "/data/Qwen3.6-35B-A3B-bf16",
+  "input_token_count": 15,
+  "atol_threshold": 0.01,
+  "top5": [
+    {
+      "rank": 1,
+      "token_id": 421,
+      "token_str": " that",
+      "logit": 21.875
+    },
+    {
+      "rank": 2,
+      "token_id": 279,
+      "token_str": " the",
+      "logit": 20.0
+    },
+    {
+      "rank": 3,
+      "token_id": 1204,
+      "token_str": " how",
+      "logit": 18.625
+    },
+    {
+      "rank": 4,
+      "token_id": 303,
+      "token_str": " in",
+      "logit": 18.375
+    },
+    {
+      "rank": 5,
+      "token_id": 25,
+      "token_str": ":",
+      "logit": 18.0
+    }
+  ],
+  "note": "Logit tensor saved to reference_logits.pt. Phase 2+ must match top-1 token and pass torch.allclose(atol=0.01) against this tensor."
+}

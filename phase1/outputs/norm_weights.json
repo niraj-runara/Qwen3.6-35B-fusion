@@ -1,0 +1,38 @@
+[
+  {
+    "layer": 0,
+    "norm": "input_layernorm",
+    "mean": 0.031111,
+    "std": 0.04899,
+    "min": -0.080078,
+    "max": 0.330078,
+    "gamma_approx_one": false
+  },
+  {
+    "layer": 0,
+    "norm": "post_attention_layernorm",
+    "mean": -0.104914,
+    "std": 0.157347,
+    "min": -0.8125,
+    "max": 0.474609,
+    "gamma_approx_one": false
+  },
+  {
+    "layer": 39,
+    "norm": "input_layernorm",
+    "mean": -0.07035,
+    "std": 0.123989,
+    "min": -0.253906,
+    "max": 0.535156,
+    "gamma_approx_one": false
+  },
+  {
+    "layer": 39,
+    "norm": "post_attention_layernorm",
+    "mean": 0.376676,
+    "std": 0.110358,
+    "min": -0.037109,
+    "max": 1.085938,
+    "gamma_approx_one": false
+  }
+]

@@ -1,0 +1,35 @@
+{
+  "decoder_layer": [
+    "Conv1d",
+    "Linear",
+    "Qwen3_5MoeAttention",
+    "Qwen3_5MoeDecoderLayer",
+    "Qwen3_5MoeExperts",
+    "Qwen3_5MoeGatedDeltaNet",
+    "Qwen3_5MoeMLP",
+    "Qwen3_5MoeRMSNorm",
+    "Qwen3_5MoeRMSNormGated",
+    "Qwen3_5MoeSparseMoeBlock",
+    "Qwen3_5MoeTopKRouter",
+    "SiLUActivation"
+  ],
+  "attention": [
+    "Linear",
+    "Qwen3_5MoeAttention",
+    "Qwen3_5MoeRMSNorm"
+  ],
+  "mlp_block": [
+    "Linear",
+    "Qwen3_5MoeExperts",
+    "Qwen3_5MoeMLP",
+    "Qwen3_5MoeSparseMoeBlock",
+    "Qwen3_5MoeTopKRouter",
+    "SiLUActivation"
+  ],
+  "expert": [
+    "SiLUActivation"
+  ],
+  "norm": [
+    "Qwen3_5MoeRMSNorm"
+  ]
+}
