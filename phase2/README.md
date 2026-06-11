@@ -93,6 +93,32 @@ Checkpoints are loaded **one at a time** (~70 GB each): load → extract one lay
 
 `load_mode: full` in the CSV means the **entire checkpoint file** was loaded to extract layer weights — not that the full 35B model was timed end-to-end.
 
+### E2E prefill (full model, separate script)
+
+`benchmark_e2e_prefill.py` mirrors **phase3**’s shape grid and CSV schema but runs through native HuggingFace `AutoModelForCausalLM` instead of SGLang. Checkpoints are still loaded **sequentially** (unfused sweep → free → fused sweep).
+
+```bash
+# Smoke test
+python phase2/benchmark_e2e_prefill.py \
+    --unfused-dir /data/Qwen3.6-35B-A3B-bf16 \
+    --fused-dir   /data/Qwen3.6-35B-A3B-bf16-fused \
+    --test-load
+
+# Full sweep (Site-1 kernel V2 on fused ckpt)
+python phase2/benchmark_e2e_prefill.py \
+    --unfused-dir /data/Qwen3.6-35B-A3B-bf16 \
+    --fused-dir   /data/Qwen3.6-35B-A3B-bf16-fused \
+    --variant V2
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--no-kernel` | Fused arm uses weight-fused ckpt only (no runtime `FusedRMSNormLinear` patch) |
+| `--check-logits` | Top-1 token check vs Phase 1 oracle on unfused ckpt |
+| `--no-save` | Skip CSV under `phase2/results/` |
+
+E2E speedup is **diluted** vs the microbenchmark above — fusion is only Site 1 (attn input projections) in this script; MoE Site 2 still uses stock HF forward. Compare with `phase3/benchmark_sglang.py` for vanilla SGLang prefill baseline.
+
 ---
 
 ## Results — RTX PRO 6000 Blackwell (2026-06-11)
@@ -169,7 +195,9 @@ Best moe speedup in this run: **1.9169** at batch=8, seq=2048.
 
 | File | Purpose |
 |------|---------|
-| `benchmark_fused_vs_unfused.py` | Main benchmark script |
+| `benchmark_fused_vs_unfused.py` | Per-site microbenchmark (one decoder layer) |
+| `benchmark_e2e_prefill.py` | Full-model HF prefill (fused vs unfused) |
+| `patch_hf_kernel_fusion.py` | Site-1 runtime kernel patch for HF decoder layers |
 | `fusion_bf16.py` | `FusedRMSNormLinear` V1/V2 modules |
 | `results/*.csv` | Timestamped benchmark outputs |
 
@@ -178,5 +206,5 @@ Best moe speedup in this run: **1.9169** at batch=8, seq=2048.
 ## Next
 
 - Benchmark other layers: `--layer-idx 3` (full attention), `7`, `11`, …
-- Full-model prefill/decode (no kernel patch yet): `phase1/run_phase1.py --benchmark` on each checkpoint separately
-- Phase 3+: integrate fused path into SGLang / vLLM for end-to-end serving speedup
+- Run E2E prefill and compare with Phase 3 SGLang baseline on the same GPU
+- Phase 4: fused ckpt + kernel hooks in SGLang for serving speedup
