@@ -12,8 +12,12 @@ produces a CSV in the benchmark_reference format so Phase 1 and Phase 2
 results are directly comparable.
 
 Fusion sites benchmarked:
-  attn  input_layernorm + q_proj   (h=4096 → 4096)
-  moe   post_attention_layernorm + experts[0].gate_proj  (h=4096 → 1536)
+  attn  input_layernorm + attention input projection
+        full_attention layers: self_attn.q_proj
+        linear_attention layers: linear_attn.in_proj_qkv  (Gated DeltaNet)
+  moe   post_attention_layernorm + expert gate projection
+        Qwen3.5 MoE: experts.gate_up_proj[expert_idx] gate half
+        legacy MoE:  experts[expert_idx].gate_proj
 
 Usage
 ─────
@@ -101,6 +105,20 @@ class _UnfusedNormLinear(nn.Module):
         return out[0] if isinstance(out, tuple) else out
 
 
+class _WeightLinear(nn.Module):
+    """nn.Linear-compatible wrapper for a standalone weight matrix."""
+
+    def __init__(self, weight: torch.Tensor, bias: torch.Tensor | None = None):
+        super().__init__()
+        self.register_buffer("weight", weight)
+        if bias is not None:
+            self.register_buffer("bias", bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bias = getattr(self, "bias", None)
+        return torch.nn.functional.linear(x, self.weight, bias)
+
+
 # ---------------------------------------------------------------------------
 # Load helpers
 # ---------------------------------------------------------------------------
@@ -142,25 +160,62 @@ def _get_norm_eps(norm: nn.Module) -> float:
 # Build benchmark modules
 # ---------------------------------------------------------------------------
 
-def _build_attn_module(layer: nn.Module) -> _UnfusedNormLinear:
-    """input_layernorm + q_proj."""
-    return _UnfusedNormLinear(
-        layer.input_layernorm,
-        layer.self_attn.q_proj,
+def _layer_type(layer: nn.Module) -> str:
+    return str(getattr(layer, "layer_type", "full_attention"))
+
+
+def _resolve_attn_linear(layer: nn.Module) -> nn.Module:
+    """Primary attention input projection for fusion site 1."""
+    if hasattr(layer, "self_attn"):
+        return layer.self_attn.q_proj
+    if hasattr(layer, "linear_attn"):
+        return layer.linear_attn.in_proj_qkv
+    raise AttributeError(
+        f"{type(layer).__name__} has neither self_attn nor linear_attn "
+        f"(layer_type={_layer_type(layer)})"
     )
 
 
+def _resolve_moe_gate_linear(layer: nn.Module, expert_idx: int = 0) -> nn.Module:
+    """Expert gate projection for fusion site 2."""
+    mlp = layer.mlp
+    experts = getattr(mlp, "experts", None)
+
+    if experts is not None:
+        gate_up = getattr(experts, "gate_up_proj", None)
+        if isinstance(gate_up, torch.Tensor) and gate_up.ndim == 3:
+            mid = gate_up.shape[1] // 2
+            return _WeightLinear(gate_up[expert_idx, :mid, :])
+
+        if hasattr(experts, "__getitem__"):
+            try:
+                expert = experts[expert_idx]
+            except (IndexError, TypeError) as exc:
+                raise RuntimeError(
+                    f"expert_idx={expert_idx} out of range for {type(experts).__name__}"
+                ) from exc
+            if hasattr(expert, "gate_proj"):
+                return expert.gate_proj
+
+    if hasattr(mlp, "gate_proj"):
+        return mlp.gate_proj
+
+    raise RuntimeError(
+        f"No gate projection found under mlp ({type(mlp).__name__}) — is this a MoE layer?"
+    )
+
+
+def _build_attn_module(layer: nn.Module) -> _UnfusedNormLinear:
+    """input_layernorm + attention input projection."""
+    return _UnfusedNormLinear(layer.input_layernorm, _resolve_attn_linear(layer))
+
+
 def _build_moe_module(layer: nn.Module, expert_idx: int = 0) -> _UnfusedNormLinear:
-    """post_attention_layernorm + experts[expert_idx].gate_proj (or dense gate_proj)."""
-    norm = layer.post_attention_layernorm
-    experts = getattr(layer.mlp, "experts", None)
-    if experts is not None and len(experts) > expert_idx:
-        gate = experts[expert_idx].gate_proj
-    elif hasattr(layer.mlp, "gate_proj"):
-        gate = layer.mlp.gate_proj
-    else:
-        raise RuntimeError("No gate_proj found under mlp — is this a MoE layer?")
-    return _UnfusedNormLinear(norm, gate)
+    """post_attention_layernorm + expert gate projection."""
+    return _UnfusedNormLinear(
+        layer.post_attention_layernorm,
+        _resolve_moe_gate_linear(layer, expert_idx=expert_idx),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +375,13 @@ def main() -> None:
 
     model = _load_model(args.model_dir)
     layer = _extract_layer(model, args.layer_idx)
+    hidden_size = layer.hidden_size
+
+    print(f"  Layer type: {_layer_type(layer)}")
+    if _layer_type(layer) == "linear_attention":
+        print("  Attn site : input_layernorm + linear_attn.in_proj_qkv")
+    else:
+        print("  Attn site : input_layernorm + self_attn.q_proj")
 
     sites = ["attn", "moe"] if args.site == "all" else [args.site]
 
@@ -330,7 +392,7 @@ def main() -> None:
         for site in sites:
             module = _build_attn_module(layer) if site == "attn" else _build_moe_module(layer)
             module = module.to(DEVICE, dtype=DTYPE).eval()
-            x = torch.randn(1, 128, 4096, device=DEVICE, dtype=DTYPE)
+            x = torch.randn(1, 128, hidden_size, device=DEVICE, dtype=DTYPE)
             with torch.no_grad():
                 y = module(x)
             print(f"[{site}] Forward OK — output shape: {tuple(y.shape)}")
