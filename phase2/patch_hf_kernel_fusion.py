@@ -37,51 +37,51 @@ def _patch_self_attn_site1(self_attn: nn.Module, fused_projs: nn.ModuleList) -> 
     self_attn.v_proj = fused_projs[2]
 
 
-def _make_patched_decoder_forward(layer: nn.Module, original_forward):
+def _patched_decoder_forward(
+    self,
+    hidden_states,
+    position_embeddings=None,
+    attention_mask=None,
+    position_ids=None,
+    past_key_values=None,
+    **kwargs,
+):
     """Decoder forward that feeds raw hidden states into the patched token mixer."""
+    if position_embeddings is None:
+        position_embeddings = kwargs.pop("position_embeddings", None)
 
-    def forward(
-        hidden_states,
-        position_embeddings,
-        attention_mask=None,
-        position_ids=None,
-        past_key_values=None,
-        **kwargs,
-    ):
-        residual = hidden_states
-        raw = hidden_states
+    residual = hidden_states
+    raw = hidden_states
 
-        if layer.layer_type == LAYER_LINEAR:
-            hidden_states = layer.linear_attn(
-                raw,
-                cache_params=past_key_values,
-                attention_mask=attention_mask,
-                **kwargs,
-            )
-        elif layer.layer_type == LAYER_FULL:
-            hidden_states, _ = layer.self_attn(
-                raw,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                position_embeddings=position_embeddings,
-                **kwargs,
-            )
-        else:
-            raise ValueError(f"Unknown layer_type={layer.layer_type!r}")
+    if self.layer_type == LAYER_LINEAR:
+        hidden_states = self.linear_attn(
+            raw,
+            cache_params=past_key_values,
+            attention_mask=attention_mask,
+            **kwargs,
+        )
+    elif self.layer_type == LAYER_FULL:
+        hidden_states, _ = self.self_attn(
+            raw,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+    else:
+        raise ValueError(f"Unknown layer_type={self.layer_type!r}")
 
-        hidden_states = residual + hidden_states
+    hidden_states = residual + hidden_states
 
-        residual = hidden_states
-        hidden_states = layer.post_attention_layernorm(hidden_states)
-        hidden_states = layer.mlp(hidden_states)
-        if isinstance(hidden_states, tuple):
-            hidden_states, _ = hidden_states
-        hidden_states = residual + hidden_states
+    residual = hidden_states
+    hidden_states = self.post_attention_layernorm(hidden_states)
+    hidden_states = self.mlp(hidden_states)
+    if isinstance(hidden_states, tuple):
+        hidden_states, _ = hidden_states
+    hidden_states = residual + hidden_states
 
-        return hidden_states
-
-    return forward
+    return hidden_states
 
 
 def patch_decoder_layer(layer: nn.Module, layer_idx: int, *, variant: str = "V2") -> None:
@@ -101,10 +101,7 @@ def patch_decoder_layer(layer: nn.Module, layer_idx: int, *, variant: str = "V2"
     else:
         raise ValueError(f"Unknown layer_type={layer.layer_type!r}")
 
-    layer.forward = types.MethodType(
-        _make_patched_decoder_forward(layer, layer.forward),
-        layer,
-    )
+    layer.forward = types.MethodType(_patched_decoder_forward, layer)
 
 
 def apply_hf_kernel_fusion(model: nn.Module, *, variant: str = "V2") -> int:

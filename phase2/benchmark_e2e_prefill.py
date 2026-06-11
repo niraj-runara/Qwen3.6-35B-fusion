@@ -217,15 +217,24 @@ def _load_model(model_dir: str, label: str) -> nn.Module:
         raise FileNotFoundError(f"Checkpoint not found: {model_dir}")
     print(f"\nLoading {label} from {model_dir} ...")
     t0 = time.time()
+    # Pin to a single GPU so sequential unfused→fused loads reuse the same
+    # ~65 GB pool.  device_map="auto" can CPU-offload when it sees cached
+    # memory from the previous checkpoint as "used".
     model = AutoModelForCausalLM.from_pretrained(
         model_dir,
         torch_dtype=DTYPE,
-        device_map="auto",
+        device_map="cuda:0",
         trust_remote_code=True,
         attn_implementation="eager",
         low_cpu_mem_usage=True,
     )
     model.eval()
+    off_device = [n for n, p in model.named_parameters() if p.device.type != "cuda"]
+    if off_device:
+        raise RuntimeError(
+            f"{label}: {len(off_device)} parameters not on CUDA "
+            f"(e.g. {off_device[0]}). Free GPU memory before loading the next checkpoint."
+        )
     print(f"  {label} loaded in {time.time() - t0:.0f}s")
     _print_gpu_mem(label)
     return model
@@ -235,8 +244,10 @@ def _free_model(model: nn.Module | None) -> None:
     if model is None:
         return
     del model
-    gc.collect()
+    for _ in range(2):
+        gc.collect()
     if torch.cuda.is_available():
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
     _print_gpu_mem("after free")
 
