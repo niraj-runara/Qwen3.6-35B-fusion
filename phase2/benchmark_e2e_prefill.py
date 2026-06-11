@@ -34,6 +34,7 @@ import os
 import statistics
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 import torch
@@ -240,16 +241,45 @@ def _load_model(model_dir: str, label: str) -> nn.Module:
     return model
 
 
-def _free_model(model: nn.Module | None) -> None:
-    if model is None:
-        return
-    del model
-    for _ in range(2):
+def _release_model(model: nn.Module) -> None:
+    """Strip accelerate hooks so the caller's ``del model`` frees GPU memory."""
+    for module in model.modules():
+        hook = getattr(module, "_hf_hook", None)
+        if hook is not None:
+            try:
+                hook.detach_hook(module)
+            except Exception:
+                pass
+            try:
+                del module._hf_hook
+            except AttributeError:
+                pass
+        if hasattr(module, "_old_forward"):
+            del module._old_forward
+    if hasattr(model, "hf_device_map"):
+        model.hf_device_map = None
+
+
+def _cuda_gc(label: str = "after free", *, quiet: bool = False) -> None:
+    for _ in range(3):
         gc.collect()
     if torch.cuda.is_available():
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
-    _print_gpu_mem("after free")
+    if not quiet:
+        _print_gpu_mem(label)
+
+
+@contextmanager
+def _loaded_model(model_dir: str, label: str):
+    """Load one full checkpoint; guaranteed GPU release on exit."""
+    model = _load_model(model_dir, label)
+    try:
+        yield model
+    finally:
+        _release_model(model)
+        del model
+        _cuda_gc(label)
 
 
 # ---------------------------------------------------------------------------
@@ -264,14 +294,12 @@ def _run_unfused_arm(
     measure: int,
     shapes: list[tuple[int, int]],
 ) -> tuple[dict[tuple[int, int], list[float]], dict[tuple[int, int], float], dict[tuple[int, int], torch.Tensor]]:
-    model = _load_model(model_dir, "unfused")
-    device = _model_device(model)
-
     latencies: dict[tuple[int, int], list[float]] = {}
     peak_mem: dict[tuple[int, int], float] = {}
     logits_cache: dict[tuple[int, int], torch.Tensor] = {}
 
-    try:
+    with _loaded_model(model_dir, "unfused") as model:
+        device = _model_device(model)
         for batch, seq_len in shapes:
             print(f"\n{'=' * 62}")
             print(f"[unfused]  batch={batch}  seq_len={seq_len}")
@@ -299,11 +327,8 @@ def _run_unfused_arm(
             print(f"  Latency (median ms): {med:.4f}")
             print(f"  Peak mem (MB):       {peak_mem[key]:.1f}")
 
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-    finally:
-        _free_model(model)
+            del input_ids, attention_mask
+            _cuda_gc(quiet=True)
 
     return latencies, peak_mem, logits_cache
 
@@ -319,19 +344,18 @@ def _run_fused_arm(
     shapes: list[tuple[int, int]],
     unfused_logits: dict[tuple[int, int], torch.Tensor],
 ) -> tuple[dict[tuple[int, int], list[float]], dict[tuple[int, int], float], dict[tuple[int, int], tuple[float, float, float]]]:
-    model = _load_model(model_dir, "fused")
-    if use_kernel:
-        n = apply_hf_kernel_fusion(model, variant=variant)
-        print(f"  Applied Site-1 kernel fusion to {n} decoder layers (variant={variant})")
-    else:
-        print("  Kernel patch skipped (--no-kernel); weight-fused ckpt only")
-
-    device = _model_device(model)
     latencies: dict[tuple[int, int], list[float]] = {}
     peak_mem: dict[tuple[int, int], float] = {}
     numerical: dict[tuple[int, int], tuple[float, float, float]] = {}
 
-    try:
+    with _loaded_model(model_dir, "fused") as model:
+        if use_kernel:
+            n = apply_hf_kernel_fusion(model, variant=variant)
+            print(f"  Applied Site-1 kernel fusion to {n} decoder layers (variant={variant})")
+        else:
+            print("  Kernel patch skipped (--no-kernel); weight-fused ckpt only")
+
+        device = _model_device(model)
         for batch, seq_len in shapes:
             print(f"\n{'=' * 62}")
             print(f"[fused]  batch={batch}  seq_len={seq_len}")
@@ -366,11 +390,8 @@ def _run_fused_arm(
                 md, cs, kl = numerical[key]
                 print(f"  max|diff|: {md:.4f}  cosine: {cs:.6f}  KL: {kl:.2e}")
 
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-    finally:
-        _free_model(model)
+            del input_ids, attention_mask, fused_logits
+            _cuda_gc(quiet=True)
 
     return latencies, peak_mem, numerical
 
@@ -410,27 +431,30 @@ def _smoke_test(
     tokenizer = _load_tokenizer(unfused_dir)
     batch, seq_len = 1, 128
 
-    print("\n[test-load] Unfused forward ...")
-    unfused = _load_model(unfused_dir, "unfused")
-    dev = _model_device(unfused)
-    ids, mask = _make_inputs(tokenizer, batch, seq_len, dev)
-    with torch.no_grad():
-        _prefill_forward(unfused, ids, mask)
-    nf_logits = _last_token_logits(unfused, ids, mask)
-    _free_model(unfused)
+    def _run_unfused() -> torch.Tensor:
+        print("\n[test-load] Unfused forward ...")
+        with _loaded_model(unfused_dir, "unfused") as model:
+            dev = _model_device(model)
+            ids, mask = _make_inputs(tokenizer, batch, seq_len, dev)
+            with torch.no_grad():
+                _prefill_forward(model, ids, mask)
+            return _last_token_logits(model, ids, mask)
 
-    print("\n[test-load] Fused forward ...")
-    fused = _load_model(fused_dir, "fused")
-    if use_kernel:
-        apply_hf_kernel_fusion(fused, variant=variant)
-    dev = _model_device(fused)
-    ids, mask = _make_inputs(tokenizer, batch, seq_len, dev)
-    with torch.no_grad():
-        _prefill_forward(fused, ids, mask)
-    f_logits = _last_token_logits(fused, ids, mask)
-    md, cs, kl = _compare_logits(f_logits, nf_logits, n_iters=1)
-    print(f"[test-load] max|diff|={md:.4f}  cosine={cs:.6f}  KL={kl:.2e}")
-    _free_model(fused)
+    def _run_fused(nf_logits: torch.Tensor) -> None:
+        print("\n[test-load] Fused forward ...")
+        with _loaded_model(fused_dir, "fused") as model:
+            if use_kernel:
+                apply_hf_kernel_fusion(model, variant=variant)
+            dev = _model_device(model)
+            ids, mask = _make_inputs(tokenizer, batch, seq_len, dev)
+            with torch.no_grad():
+                _prefill_forward(model, ids, mask)
+            f_logits = _last_token_logits(model, ids, mask)
+            md, cs, kl = _compare_logits(f_logits, nf_logits, n_iters=1)
+            print(f"[test-load] max|diff|={md:.4f}  cosine={cs:.6f}  KL={kl:.2e}")
+
+    nf_logits = _run_unfused()
+    _run_fused(nf_logits)
     print("[test-load] PASS")
 
 
@@ -443,15 +467,12 @@ def check_logits_oracle(model_dir: str, oracle_path: Path) -> bool:
     oracle_top1 = int(oracle.argmax().item())
 
     tokenizer = _load_tokenizer(model_dir)
-    model = _load_model(model_dir, "oracle-check")
-    try:
+    with _loaded_model(model_dir, "oracle-check") as model:
         dev = _model_device(model)
         ids = tokenizer(REFERENCE_PROMPT, return_tensors="pt")["input_ids"].to(dev)
         mask = torch.ones_like(ids)
         logits = _last_token_logits(model, ids, mask)
         gen_top1 = int(logits[0].argmax().item())
-    finally:
-        _free_model(model)
 
     match = gen_top1 == oracle_top1
     print(

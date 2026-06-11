@@ -119,6 +119,8 @@ python phase2/benchmark_e2e_prefill.py \
 
 E2E speedup is **diluted** vs the microbenchmark above — fusion is only Site 1 (attn input projections) in this script; MoE Site 2 still uses stock HF forward. Compare with `phase3/benchmark_sglang.py` for vanilla SGLang prefill baseline.
 
+Checkpoints load **one at a time** (~65 GB each on a 96 GB GPU). The script uses a context manager that strips accelerate hooks and drops all references before loading the next checkpoint. After unfused teardown you should see `[after free] GPU 0: ~0.x GB` — not ~64 GB.
+
 ---
 
 ## Results — RTX PRO 6000 Blackwell (2026-06-11)
