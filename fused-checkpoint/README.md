@@ -122,6 +122,5 @@ Once the fused checkpoint is on disk, go to Phase 2 to benchmark it:
 python phase2/benchmark_fused_vs_unfused.py \
     --unfused-dir /data/Qwen3.6-35B-A3B-bf16 \
     --fused-dir   /data/Qwen3.6-35B-A3B-bf16-fused \
-    --mode checkpoints \
     --site all
 ```

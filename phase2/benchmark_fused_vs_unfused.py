@@ -1,41 +1,39 @@
 """
 Phase 2 — Benchmark: Fused vs Unfused Qwen3.6-35B-A3B (no inference engine)
 
-Measures the speedup from weight fusion + runtime kernel fusion at the
-per-fusion-site level, using the same metric set as benchmark_reference.py:
+Compares vanilla vs weight-fused checkpoints at each fusion site, using the
+same metric set as benchmark_reference.py:
   - Latency  : median ms, p99 ms over 200 timed runs
   - Memory   : peak GPU memory allocated per forward pass (MB)
   - Numerical: max |diff|, cosine similarity, KL divergence
 
-Two benchmark modes (mirrors benchmark_reference.py):
-  checkpoints   Load both the vanilla and the fused checkpoint.
-                Unfused path: norm(x) → linear(x)
-                Fused path:   linear_fused(x) / rms(x)   (gamma in weights)
-                Use this to confirm the export is correct AND measure speedup.
+Arms (both checkpoints required — no runtime weight fusion):
+  Unfused  vanilla checkpoint  → norm(x) → linear(x)
+  Fused    fused checkpoint     → FusedRMSNormLinear(V1/V2): linear_fused(x) / rms(x)
+                                   (γ absorbed offline in export_fused_weights.py)
 
-  runtime-patch Load only the vanilla checkpoint.
-                Unfused path: norm(x) → linear(x)   (baseline)
-                Fused path:   absorb gamma at runtime → linear_new(x) / rms(x)
-                Use this to isolate the kernel speedup without re-saving a checkpoint.
+Loads each full checkpoint sequentially, extracts one decoder layer, then frees
+the rest (~70 GB). Only the two small layer slices stay on GPU for the benchmark.
 
-Two fusion sites (Qwen3_5MoeDecoderLayer):
+Fusion sites (Qwen3_5MoeDecoderLayer):
   attn   input_layernorm → linear_attn.in_proj_qkv  OR  self_attn.q_proj
   moe    post_attention_layernorm → gate half of mlp.experts.gate_up_proj[0]
 
 Usage
 ─────
-  # Quickest smoke test (runtime-patch, site=attn, layer 0, one shape)
-  python benchmark_fused_vs_unfused.py \\
-      --unfused-dir /data/Qwen3.6-35B-A3B-bf16 \\
-      --mode runtime-patch --site attn --test-load
-
-  # Full checkpoints sweep (both sites, all shapes)
+  # Smoke test
   python benchmark_fused_vs_unfused.py \\
       --unfused-dir /data/Qwen3.6-35B-A3B-bf16 \\
       --fused-dir   /data/Qwen3.6-35B-A3B-bf16-fused \\
-      --mode checkpoints --site all
+      --site attn --test-load
 
-  # List all module paths in a checkpoint (no load)
+  # Full sweep (both sites, all shapes)
+  python benchmark_fused_vs_unfused.py \\
+      --unfused-dir /data/Qwen3.6-35B-A3B-bf16 \\
+      --fused-dir   /data/Qwen3.6-35B-A3B-bf16-fused \\
+      --site all
+
+  # List module paths (no load)
   python benchmark_fused_vs_unfused.py \\
       --unfused-dir /data/Qwen3.6-35B-A3B-bf16 --print-keys
 """
@@ -55,8 +53,6 @@ from typing import Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
 # ---------------------------------------------------------------------------
 # Repo root on sys.path so we can import benchmark_reference and fusion_bf16
 # ---------------------------------------------------------------------------
@@ -80,12 +76,7 @@ from benchmark_reference import (   # noqa: E402
 )
 
 # Import BF16 fusion modules
-from fusion_bf16 import (           # noqa: E402
-    FusedRMSNormLinear,
-    FusedRMSNormLinearV2,
-    VARIANTS,
-    build_fused_module,
-)
+from fusion_bf16 import VARIANTS, build_fused_module  # noqa: E402
 from qwen3_moe_layers import (      # noqa: E402
     attn_input_proj,
     attn_site_label,
@@ -135,26 +126,6 @@ class _UnfusedNormLinear(nn.Module):
         return out[0] if isinstance(out, tuple) else out
 
 
-class _FusedLinearOnly(nn.Module):
-    """
-    Checkpoints mode — fused checkpoint path: linear_fused(x) / rms(x).
-    gamma is already absorbed into weights; norm is trivial (gamma ~ 1).
-    """
-    def __init__(self, linear: nn.Module, eps: float):
-        super().__init__()
-        self.linear = linear
-        self.eps    = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        orig = x.shape
-        x_2d = x.reshape(-1, x.size(-1))
-        out  = self.linear(x_2d)
-        if isinstance(out, tuple):
-            out = out[0]
-        rms  = torch.sqrt(x_2d.float().pow(2).mean(-1, keepdim=True) + self.eps).to(x_2d.dtype)
-        return (out / rms).reshape(orig[:-1] + (out.size(-1),))
-
-
 # ---------------------------------------------------------------------------
 # Model / layer loading
 # ---------------------------------------------------------------------------
@@ -188,7 +159,7 @@ def _load_full_model(model_dir: str, label: str) -> nn.Module:
 
 
 def _extract_layer(model: nn.Module, layer_idx: int, device: str) -> nn.Module:
-    """Deep-copy a single decoder layer onto `device` and free the full model."""
+    """Deep-copy one decoder layer onto `device` and free the full model."""
     layer = copy.deepcopy(model.model.layers[layer_idx])
     del model
     gc.collect()
@@ -198,12 +169,20 @@ def _extract_layer(model: nn.Module, layer_idx: int, device: str) -> nn.Module:
     return layer
 
 
-def _get_norm_eps(norm: nn.Module) -> float:
-    return float(
-        getattr(norm, "variance_epsilon", None)
-        or getattr(norm, "eps", None)
-        or 1e-6
-    )
+def _load_decoder_layer(
+    model_dir: str,
+    layer_idx: int,
+    device: str,
+    label: str,
+) -> nn.Module:
+    """
+    Load a full checkpoint, extract one decoder layer, then drop the rest.
+
+    Only one ~70 GB model is on GPU at a time — safe for a single RTX Pro 6000.
+  """
+    model = _load_full_model(model_dir, label)
+    print(f"Extracting layer {layer_idx} from {label} (freeing full model) ...")
+    return _extract_layer(model, layer_idx, device)
 
 
 def print_model_keys(model_dir: str) -> None:
@@ -227,71 +206,40 @@ def print_model_keys(model_dir: str) -> None:
 
 def _build_attn_pair(
     layer_unfused: nn.Module,
-    layer_fused: nn.Module | None,
+    layer_fused: nn.Module,
     *,
-    mode: str,
     variant: str,
 ) -> Tuple[nn.Module, nn.Module]:
-    """
-    Build (unfused_bench, fused_bench) for the attention fusion site.
-
-    mode=checkpoints  : fused_bench loads from layer_fused (gamma in weights)
-    mode=runtime-patch: fused_bench absorbs gamma from layer_unfused at init
-    """
-    norm_uf = layer_unfused.input_layernorm
-    proj_uf = attn_input_proj(layer_unfused)
-    eps     = _get_norm_eps(norm_uf)
-
-    unfused = _UnfusedNormLinear(norm_uf, proj_uf)
-
-    if mode == "checkpoints":
-        assert layer_fused is not None, "checkpoints mode requires --fused-dir"
-        fused = _FusedLinearOnly(attn_input_proj(layer_fused), eps)
-
-    else:  # runtime-patch — Qwen3_5MoeRMSNorm scale is (1 + weight)
-        gamma = 1.0 + norm_uf.weight.detach().float()
-        proj_copy = copy.deepcopy(proj_uf)
-        with torch.no_grad():
-            proj_copy.weight.copy_(
-                (proj_copy.weight.detach().float() * gamma.unsqueeze(0)).to(DTYPE)
-            )
-        fused = build_fused_module(proj_copy, norm_uf, variant=variant)
-
+    """Unfused: vanilla norm→linear.  Fused: fused ckpt weights + FusedRMSNormLinear."""
+    unfused = _UnfusedNormLinear(
+        layer_unfused.input_layernorm,
+        attn_input_proj(layer_unfused),
+    )
+    fused = build_fused_module(
+        attn_input_proj(layer_fused),
+        layer_fused.input_layernorm,
+        variant=variant,
+    )
     return unfused, fused
 
 
 def _build_moe_pair(
     layer_unfused: nn.Module,
-    layer_fused: nn.Module | None,
+    layer_fused: nn.Module,
     *,
-    mode: str,
     variant: str,
     expert_idx: int = 0,
 ) -> Tuple[nn.Module, nn.Module]:
-    """
-    Build (unfused_bench, fused_bench) for the MoE fusion site:
-      post_attention_layernorm + gate half of experts.gate_up_proj[expert_idx]
-    """
-    norm_uf = layer_unfused.post_attention_layernorm
-    gate_uf = moe_gate_proj(layer_unfused, expert_idx)
-    eps     = _get_norm_eps(norm_uf)
-
-    unfused = _UnfusedNormLinear(norm_uf, gate_uf)
-
-    if mode == "checkpoints":
-        assert layer_fused is not None, "checkpoints mode requires --fused-dir"
-        gate_f = moe_gate_proj(layer_fused, expert_idx)
-        fused = _FusedLinearOnly(gate_f, eps)
-
-    else:  # runtime-patch — Qwen3_5MoeRMSNorm scale is (1 + weight)
-        gamma = 1.0 + norm_uf.weight.detach().float()
-        gate_copy = copy.deepcopy(gate_uf)
-        with torch.no_grad():
-            gate_copy.weight.copy_(
-                (gate_copy.weight.detach().float() * gamma.unsqueeze(0)).to(DTYPE)
-            )
-        fused = build_fused_module(gate_copy, norm_uf, variant=variant)
-
+    """Unfused: vanilla norm→gate.  Fused: fused ckpt gate + FusedRMSNormLinear."""
+    unfused = _UnfusedNormLinear(
+        layer_unfused.post_attention_layernorm,
+        moe_gate_proj(layer_unfused, expert_idx),
+    )
+    fused = build_fused_module(
+        moe_gate_proj(layer_fused, expert_idx),
+        layer_fused.post_attention_layernorm,
+        variant=variant,
+    )
     return unfused, fused
 
 
@@ -392,14 +340,13 @@ def run_site_benchmark(
 # ---------------------------------------------------------------------------
 
 def run_benchmark(
-    unfused_dir:  str,
-    fused_dir:    str | None,
+    unfused_dir: str,
+    fused_dir:   str,
     *,
-    mode:         str = "runtime-patch",
-    sites:        list[str],
-    layer_idx:    int = 0,
-    variant:      str = "V2",
-    device:       str = DEVICE,
+    sites:       list[str],
+    layer_idx:   int = 0,
+    variant:     str = "V2",
+    device:      str = DEVICE,
 ) -> dict[str, list[ShapeResult]]:
     """
     Load layers, build benchmark pairs, run sweep for each requested site.
@@ -408,19 +355,10 @@ def run_benchmark(
     """
 
     # ------------------------------------------------------------------
-    # Load models
+    # Load one decoder layer per checkpoint (sequential — not both 70 GB models)
     # ------------------------------------------------------------------
-    model_unfused = _load_full_model(unfused_dir, "unfused")
-    model_fused   = None
-    if mode == "checkpoints":
-        if not fused_dir:
-            raise ValueError("--fused-dir is required for --mode checkpoints")
-        model_fused = _load_full_model(fused_dir, "fused")
-
-    # Extract the target layers onto the benchmark device
-    print(f"\nExtracting layer {layer_idx} onto {device} ...")
-    layer_uf = _extract_layer(model_unfused, layer_idx, device)
-    layer_f  = _extract_layer(model_fused,  layer_idx, device) if model_fused else None
+    layer_uf = _load_decoder_layer(unfused_dir, layer_idx, device, "unfused")
+    layer_f  = _load_decoder_layer(fused_dir, layer_idx, device, "fused")
     hidden   = layer_uf.hidden_size
 
     print(f"\nLayer {layer_idx}: type={layer_uf.layer_type}  hidden={hidden}")
@@ -437,16 +375,14 @@ def run_benchmark(
         print(f"# Fusion site: attn  ({attn_site_label(layer_uf)})")
         print(f"{'#' * 62}")
 
-        unfused_b, fused_b = _build_attn_pair(
-            layer_uf, layer_f, mode=mode, variant=variant
-        )
+        unfused_b, fused_b = _build_attn_pair(layer_uf, layer_f, variant=variant)
         site_results = run_site_benchmark(
             unfused_b, fused_b, hidden, site_label="attn", device=device
         )
         all_results["attn"] = site_results
 
         print(f"\n{'─' * 62}")
-        print(f"Summary — attn site (layer {layer_idx}, {mode} mode)")
+        print(f"Summary — attn site (layer {layer_idx}, variant={variant})")
         print_summary_table(site_results)
 
     # ------------------------------------------------------------------
@@ -458,7 +394,7 @@ def run_benchmark(
         print(f"{'#' * 62}")
 
         unfused_b, fused_b = _build_moe_pair(
-            layer_uf, layer_f, mode=mode, variant=variant, expert_idx=0
+            layer_uf, layer_f, variant=variant, expert_idx=0
         )
         site_results = run_site_benchmark(
             unfused_b, fused_b, hidden, site_label="moe", device=device
@@ -466,7 +402,7 @@ def run_benchmark(
         all_results["moe"] = site_results
 
         print(f"\n{'─' * 62}")
-        print(f"Summary — moe site (layer {layer_idx}, {mode} mode)")
+        print(f"Summary — moe site (layer {layer_idx}, variant={variant})")
         print_summary_table(site_results)
 
     return all_results
@@ -482,7 +418,6 @@ _RESULTS_DIR = _THIS_DIR / "results"
 def _save_all(
     all_results: dict[str, list[ShapeResult]],
     *,
-    mode: str,
     variant: str,
     layer_idx: int,
     device: str,
@@ -492,14 +427,14 @@ def _save_all(
     run_ts_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     for site, results in all_results.items():
-        fname = f"benchmark_{ts}_qwen3_{mode}_{site}_{variant}_layer{layer_idx}.csv"
+        fname = f"benchmark_{ts}_qwen3_{site}_{variant}_layer{layer_idx}.csv"
         path  = str(_RESULTS_DIR / fname)
         save_csv(
             results,
             path,
             run_metadata={
                 "run_timestamp_utc": run_ts_str,
-                "benchmark_mode":    mode,
+                "benchmark_mode":    "checkpoints+kernel",
                 "fusion_point":      site,
                 "variant":           variant,
                 "load_mode":         "full",
@@ -525,16 +460,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--fused-dir",
         default=os.environ.get("FUSED_DIR", "/data/Qwen3.6-35B-A3B-bf16-fused"),
-        help="Weight-fused BF16 checkpoint (required for --mode checkpoints)",
-    )
-    p.add_argument(
-        "--mode",
-        choices=("checkpoints", "runtime-patch"),
-        default="runtime-patch",
-        help=(
-            "checkpoints: compare two checkpoints on disk. "
-            "runtime-patch: absorb gamma at runtime from the unfused checkpoint."
-        ),
+        help="Weight-fused BF16 checkpoint (from export_fused_weights.py)",
     )
     p.add_argument(
         "--site",
@@ -593,13 +519,11 @@ def main() -> None:
     print(f"  PyTorch   : {torch.__version__}")
     print(f"  CUDA      : {torch.version.cuda}")
     print(f"  GPU       : {torch.cuda.get_device_name(0)}")
-    print(f"  Mode      : {args.mode}")
     print(f"  Site      : {args.site}")
     print(f"  Variant   : {args.variant}")
     print(f"  Layer idx : {args.layer_idx}")
     print(f"  Unfused   : {args.unfused_dir}")
-    if args.mode == "checkpoints":
-        print(f"  Fused     : {args.fused_dir}")
+    print(f"  Fused     : {args.fused_dir}")
     print(f"  Warmup    : {WARMUP_ITERS}  |  Measure: {MEASURE_ITERS}")
 
     if args.print_keys:
@@ -612,13 +536,12 @@ def main() -> None:
     # Smoke test
     # ------------------------------------------------------------------
     if args.test_load:
-        model_uf = _load_full_model(args.unfused_dir, "unfused")
-        layer_uf = _extract_layer(model_uf, args.layer_idx, args.device)
-
-        layer_f = None
-        if args.mode == "checkpoints":
-            model_f  = _load_full_model(args.fused_dir, "fused")
-            layer_f  = _extract_layer(model_f, args.layer_idx, args.device)
+        layer_uf = _load_decoder_layer(
+            args.unfused_dir, args.layer_idx, args.device, "unfused"
+        )
+        layer_f = _load_decoder_layer(
+            args.fused_dir, args.layer_idx, args.device, "fused"
+        )
 
         hidden = layer_uf.hidden_size
         print(f"\nLayer {args.layer_idx}: type={layer_uf.layer_type}  hidden={hidden}")
@@ -626,9 +549,9 @@ def main() -> None:
 
         for site in sites:
             if site == "attn":
-                uf_b, f_b = _build_attn_pair(layer_uf, layer_f, mode=args.mode, variant=args.variant)
+                uf_b, f_b = _build_attn_pair(layer_uf, layer_f, variant=args.variant)
             else:
-                uf_b, f_b = _build_moe_pair(layer_uf, layer_f, mode=args.mode, variant=args.variant)
+                uf_b, f_b = _build_moe_pair(layer_uf, layer_f, variant=args.variant)
 
             uf_b = uf_b.to(args.device, dtype=DTYPE).eval()
             f_b  = f_b.to(args.device,  dtype=DTYPE).eval()
@@ -653,8 +576,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     all_results = run_benchmark(
         args.unfused_dir,
-        args.fused_dir if args.mode == "checkpoints" else None,
-        mode=args.mode,
+        args.fused_dir,
         sites=sites,
         layer_idx=args.layer_idx,
         variant=args.variant,
@@ -667,7 +589,6 @@ def main() -> None:
     if not args.no_save:
         _save_all(
             all_results,
-            mode=args.mode,
             variant=args.variant,
             layer_idx=args.layer_idx,
             device=args.device,
