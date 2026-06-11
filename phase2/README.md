@@ -105,41 +105,45 @@ Raw CSVs: `phase2/results/benchmark_20260611T183156Z_qwen3_attn_V2_layer0.csv` a
 
 ### Site 1 — `attn` (`input_layernorm` → `in_proj_qkv`, out_dim 8192)
 
-| batch | seq_len | unfused ms | fused ms | speedup | max \|diff\| | cosine sim |
-|------:|--------:|-----------:|---------:|--------:|-------------:|-----------:|
-| 1 | 128 | 0.110 | 0.093 | **1.18×** | 0.0625 | 1.0000 |
-| 1 | 512 | 0.153 | 0.097 | **1.58×** | 0.0625 | 1.0000 |
-| 1 | 2048 | 0.282 | 0.264 | **1.07×** | 0.0625 | 1.0000 |
-| 8 | 128 | 0.202 | 0.152 | **1.32×** | 0.0625 | 1.0000 |
-| 8 | 512 | 0.533 | 0.524 | **1.02×** | 0.1250 | 1.0000 |
-| 8 | 2048 | 2.259 | 2.070 | **1.09×** | 0.1250 | 1.0000 |
-| 32 | 128 | 0.532 | 0.502 | **1.06×** | 0.1250 | 1.0000 |
-| 32 | 512 | 2.189 | 2.070 | **1.06×** | 0.1250 | 1.0000 |
-| 32 | 2048 | 8.938 | 8.548 | **1.05×** | 0.1250 | 1.0000 |
+From `benchmark_20260611T183156Z_qwen3_attn_V2_layer0.csv`. Latency/speedup: 4 dp; `cosine_sim`: truncated to 4 dp (never rounded to 1.0000); `kl_divergence`: scientific notation, 4 dp mantissa.
 
-Best attn speedup: **1.58×** at batch=1, seq=512. Gains are modest when the matmul dominates (large batch × seq).
+| batch | seq_len | nonfused_median_ms | fused_median_ms | speedup | nonfused_p99_ms | fused_p99_ms | max_abs_diff | cosine_sim | kl_divergence |
+|------:|--------:|-------------------:|----------------:|--------:|----------------:|-------------:|-------------:|-----------:|--------------:|
+| 1 | 128 | 0.1098 | 0.0929 | 1.1817 | 0.1234 | 0.1085 | 0.0625 | 0.9999 | 1.8530e-05 |
+| 1 | 512 | 0.1533 | 0.0973 | 1.5750 | 0.1617 | 0.1065 | 0.0625 | 0.9999 | 2.3378e-05 |
+| 1 | 2048 | 0.2817 | 0.2644 | 1.0654 | 0.2904 | 0.2734 | 0.0625 | 0.9999 | 2.2103e-05 |
+| 8 | 128 | 0.2015 | 0.1523 | 1.3231 | 0.2127 | 0.1610 | 0.0625 | 0.9999 | 2.5118e-05 |
+| 8 | 512 | 0.5328 | 0.5239 | 1.0170 | 0.5414 | 0.5320 | 0.1250 | 0.9999 | 2.2243e-05 |
+| 8 | 2048 | 2.2592 | 2.0702 | 1.0913 | 2.3036 | 2.0888 | 0.1250 | 0.9999 | 2.2842e-05 |
+| 32 | 128 | 0.5324 | 0.5023 | 1.0599 | 0.5376 | 0.5237 | 0.1250 | 0.9999 | 2.3469e-05 |
+| 32 | 512 | 2.1888 | 2.0697 | 1.0575 | 2.2985 | 2.0814 | 0.1250 | 0.9999 | 2.3282e-05 |
+| 32 | 2048 | 8.9380 | 8.5482 | 1.0456 | 9.3513 | 8.6066 | 0.1250 | 0.9999 | 2.2382e-05 |
+
+Best attn speedup in this run: **1.5750** at batch=1, seq=512.
 
 ### Site 2 — `moe` (`post_attention_layernorm` → expert-0 gate, out_dim 512)
 
-| batch | seq_len | unfused ms | fused ms | speedup | max \|diff\| | cosine sim |
-|------:|--------:|-----------:|---------:|--------:|-------------:|-----------:|
-| 1 | 128 | 0.095 | 0.095 | **1.01×** | 0.0156 | 1.0000 |
-| 1 | 512 | 0.100 | 0.095 | **1.06×** | 0.0156 | 1.0000 |
-| 1 | 2048 | 0.108 | 0.089 | **1.21×** | 0.0156 | 1.0000 |
-| 8 | 128 | 0.105 | 0.093 | **1.13×** | 0.0156 | 1.0000 |
-| 8 | 512 | 0.151 | 0.098 | **1.54×** | 0.0156 | 1.0000 |
-| 8 | 2048 | 0.961 | 0.501 | **1.92×** | 0.0156 | 1.0000 |
-| 32 | 128 | 0.150 | 0.099 | **1.53×** | 0.0156 | 1.0000 |
-| 32 | 512 | 0.961 | 0.502 | **1.92×** | 0.0156 | 1.0000 |
-| 32 | 2048 | 4.082 | 2.186 | **1.87×** | 0.0156 | 1.0000 |
+From `benchmark_20260611T183156Z_qwen3_moe_V2_layer0.csv`. Same formatting as attn table above.
 
-Best moe speedup: **~1.9×** at batch≥8, seq≥512. Smaller gate matrix → norm overhead was a larger fraction of unfused time.
+| batch | seq_len | nonfused_median_ms | fused_median_ms | speedup | nonfused_p99_ms | fused_p99_ms | max_abs_diff | cosine_sim | kl_divergence |
+|------:|--------:|-------------------:|----------------:|--------:|----------------:|-------------:|-------------:|-----------:|--------------:|
+| 1 | 128 | 0.0952 | 0.0947 | 1.0050 | 0.1107 | 0.1048 | 0.0156 | 0.9999 | 8.9276e-07 |
+| 1 | 512 | 0.0997 | 0.0945 | 1.0554 | 0.1105 | 0.1072 | 0.0156 | 0.9999 | 8.4567e-07 |
+| 1 | 2048 | 0.1079 | 0.0893 | 1.2081 | 0.1190 | 0.0994 | 0.0156 | 0.9999 | 6.3802e-07 |
+| 8 | 128 | 0.1054 | 0.0933 | 1.1301 | 0.1212 | 0.1043 | 0.0156 | 0.9999 | 8.5375e-07 |
+| 8 | 512 | 0.1512 | 0.0984 | 1.5371 | 0.1598 | 0.1060 | 0.0156 | 0.9999 | 6.3074e-07 |
+| 8 | 2048 | 0.9611 | 0.5014 | 1.9169 | 0.9741 | 0.5091 | 0.0156 | 0.9999 | 7.3108e-07 |
+| 32 | 128 | 0.1503 | 0.0985 | 1.5257 | 0.1577 | 0.1083 | 0.0156 | 0.9999 | 6.3300e-07 |
+| 32 | 512 | 0.9611 | 0.5018 | 1.9153 | 0.9693 | 0.5135 | 0.0156 | 0.9999 | 7.3418e-07 |
+| 32 | 2048 | 4.0819 | 2.1862 | 1.8671 | 4.1139 | 2.1970 | 0.0156 | 0.9999 | 6.3325e-07 |
+
+Best moe speedup in this run: **1.9169** at batch=8, seq=2048.
 
 ### Takeaways
 
-- **Numerics:** cosine similarity ≈ 1.0 and tiny KL on all shapes — fusion is faithful at the op level.
-- **MoE site** shows stronger speedups than **attn** on this layer, especially at larger token counts.
-- **Attn site** peaks around **1.5×** for small batch prefill-like shapes; approaches **~1.05×** when compute-bound.
+- **Numerics:** `cosine_sim` ≈ 0.9999 (not exactly 1); `kl_divergence` ≈ 1e-05 (attn) or 1e-07 (moe).
+- **MoE site** shows stronger speedups than **attn** on this layer at larger token counts.
+- **Attn site** peaks at speedup **1.5750** (batch=1, seq=512); minimum **1.0170** (batch=8, seq=512).
 - Results are for **layer 0 only** (`linear_attention`). Re-run with `--layer-idx 3` for a `full_attention` layer.
 
 ---
