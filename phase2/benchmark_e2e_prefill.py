@@ -415,11 +415,16 @@ def _run_fused_arm(
     with _loaded_model(model_dir, "fused", attn_implementation=attn_implementation) as model:
         if use_kernel:
             n = apply_hf_kernel_fusion(model, variant=variant, site2=site2)
-            sites = "Site-1+2" if site2 else "Site-1"
-            print(
-                f"  Applied {sites} shared-rms kernel fusion to {n} decoder "
-                f"layers (variant={variant})"
-            )
+            if site2:
+                print(
+                    f"  Applied Site-1+2 experimental kernel fusion to {n} layers "
+                    f"(variant={variant})"
+                )
+            else:
+                print(
+                    f"  Applied Site-1 fast-path fusion to {n} layers "
+                    f"(one rms → stock linears; Site-2 stock MoE)"
+                )
         else:
             print("  Kernel patch skipped (--no-kernel); weight-fused ckpt only")
 
@@ -445,7 +450,14 @@ def _run_fused_arm(
             peak_mem[key] = peak
 
             if fused_logits is not None and key in unfused_logits:
-                numerical[key] = _compare_logits(fused_logits, unfused_logits[key])
+                if torch.isnan(fused_logits).any():
+                    print("  [warn] fused logits contain NaN — numerics skipped")
+                    numerical[key] = (float("nan"), float("nan"), float("nan"))
+                else:
+                    numerical[key] = _compare_logits(fused_logits, unfused_logits[key])
+            elif fused_logits is not None and key not in unfused_logits:
+                print("  [warn] no unfused logits for this shape (numerics skipped)")
+                numerical[key] = (float("nan"), float("nan"), float("nan"))
             else:
                 numerical[key] = (float("nan"), float("nan"), float("nan"))
 
@@ -598,9 +610,14 @@ def parse_args() -> argparse.Namespace:
         help="Subset of shapes to run, e.g. --shapes 32,2048 (default: all 9)",
     )
     p.add_argument(
-        "--no-site2",
+        "--site2",
         action="store_true",
-        help="Site-1 kernel only (skip MoE Site-2 shared-rms patch)",
+        help="Experimental Site-2 MoE runtime patch (default: off; use stock MoE)",
+    )
+    p.add_argument(
+        "--fused-only",
+        action="store_true",
+        help="Run fused arm only (skip unfused load; numerics NaN unless re-run full)",
     )
     p.add_argument("--warmup", type=int, default=WARMUP_ITERS)
     p.add_argument("--measure", type=int, default=MEASURE_ITERS)
@@ -629,7 +646,7 @@ def main() -> None:
     hidden = int(getattr(text_cfg, "hidden_size", 2048))
     out_dim = int(getattr(text_cfg, "vocab_size", 0)) or 0
     use_kernel = not args.no_kernel
-    site2 = not args.no_site2
+    site2 = args.site2
     shapes = _parse_shapes(args.shapes)
 
     print("=" * 62)
@@ -639,7 +656,11 @@ def main() -> None:
     print(f"  Fused    : {args.fused_dir}")
     kernel_desc = "disabled (weights only)"
     if use_kernel:
-        kernel_desc = f"Site-1{'+2' if site2 else ''} {args.variant} shared-rms"
+        kernel_desc = (
+            f"Site-1+2 experimental ({args.variant})"
+            if site2
+            else "Site-1 fast-path (one rms, stock linears)"
+        )
     print(f"  Kernel   : {kernel_desc}")
     print(f"  Attn     : {args.attn_implementation}")
     print(f"  Hidden   : {hidden}")
@@ -666,21 +687,28 @@ def main() -> None:
         print("[check-logits] PASS")
 
     tokenizer = _load_tokenizer(args.unfused_dir)
+    nf_lat: dict = {}
+    nf_mem: dict = {}
+    nf_logits: dict = {}
 
-    print(f"\n{'─' * 62}")
-    print("Arm 1/2 — unfused checkpoint (sequential load)")
-    print(f"{'─' * 62}")
-    nf_lat, nf_mem, nf_logits = _run_unfused_arm(
-        args.unfused_dir,
-        tokenizer,
-        attn_implementation=args.attn_implementation,
-        warmup=args.warmup,
-        measure=args.measure,
-        shapes=shapes,
-    )
+    if not args.fused_only:
+        print(f"\n{'─' * 62}")
+        print("Arm 1/2 — unfused checkpoint (sequential load)")
+        print(f"{'─' * 62}")
+        nf_lat, nf_mem, nf_logits = _run_unfused_arm(
+            args.unfused_dir,
+            tokenizer,
+            attn_implementation=args.attn_implementation,
+            warmup=args.warmup,
+            measure=args.measure,
+            shapes=shapes,
+        )
+    else:
+        print("\n[--fused-only] Skipping unfused arm")
 
+    arm_label = "fused only" if args.fused_only else "Arm 2/2 — fused checkpoint"
     print(f"\n{'─' * 62}")
-    print("Arm 2/2 — fused checkpoint (sequential load)")
+    print(f"{arm_label} (sequential load)")
     print(f"{'─' * 62}")
     f_lat, f_mem, numerical = _run_fused_arm(
         args.fused_dir,

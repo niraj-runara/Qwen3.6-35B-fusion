@@ -56,6 +56,17 @@ def _norm_eps(norm: nn.Module) -> float:
     )
 
 
+def fused_rms_normalize(x: torch.Tensor, eps: float) -> torch.Tensor:
+    """
+    ``x / rms(x)`` for weight-fused checkpoints (γ absorbed offline).
+
+    Used by the E2E HF patch: one rms per layer, then stock nn.Linear modules.
+    """
+    shape = x.shape
+    x_2d = x.reshape(-1, x.size(-1))
+    return (x_2d / _rms(x_2d, eps)).reshape(shape)
+
+
 # ---------------------------------------------------------------------------
 # Shared per-layer RMS (E2E / full decoder patch)
 # ---------------------------------------------------------------------------

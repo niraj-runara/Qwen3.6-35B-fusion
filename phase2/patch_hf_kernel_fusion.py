@@ -1,12 +1,15 @@
 """
-Runtime kernel fusion for HuggingFace Qwen3_5MoeDecoderLayer (fused checkpoint).
+Runtime fusion for HuggingFace Qwen3_5MoeDecoderLayer (weight-fused checkpoint).
 
-Site 1 (input_layernorm → token-mixer input projections):
-  - Skip ``input_layernorm``; one shared rms(x) for q/k/v or four ``in_proj_*``.
+E2E strategy (fast path, default):
+  Site 1 — compute ``x / rms(x)`` once per layer, feed stock token-mixer linears
+           (γ already absorbed offline).  Skips ``input_layernorm``.
+  Site 2 — **off by default**.  Fused ckpt already has γ in MoE weights and
+           ``post_attention_layernorm.weight ≈ 0``; stock norm + MoE is correct
+           and faster than wrapping every MoE linear in Python.
 
-Site 2 (post_attention_layernorm → MoE block inputs):
-  - Skip ``post_attention_layernorm``; one shared rms(x) for router, experts,
-    shared expert gate/up, and shared-expert gate scalar.
+Optional ``--site2`` enables experimental MoE runtime patch (microbench-style;
+usually slower in full-model HF forward).
 """
 
 from __future__ import annotations
@@ -17,7 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from fusion_bf16 import SharedRmsLinear, SharedRmsState, _norm_eps
+from fusion_bf16 import SharedRmsLinear, SharedRmsState, _norm_eps, fused_rms_normalize
 from qwen3_moe_layers import (
     LAYER_FULL,
     LAYER_LINEAR,
@@ -27,6 +30,60 @@ from qwen3_moe_layers import (
 _LINEAR_ATTN_PROJS = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
 _SELF_ATTN_PROJS = ("q_proj", "k_proj", "v_proj")
 
+
+# ---------------------------------------------------------------------------
+# Site 1 — one rms, stock linears (default E2E path)
+# ---------------------------------------------------------------------------
+
+def _patched_decoder_forward_site1_only(
+    self,
+    hidden_states,
+    position_embeddings=None,
+    attention_mask=None,
+    position_ids=None,
+    past_key_values=None,
+    **kwargs,
+):
+    if position_embeddings is None:
+        position_embeddings = kwargs.pop("position_embeddings", None)
+
+    residual = hidden_states
+    normed = fused_rms_normalize(hidden_states, self._hf_site1_eps)
+
+    if self.layer_type == LAYER_LINEAR:
+        hidden_states = self.linear_attn(
+            normed,
+            cache_params=past_key_values,
+            attention_mask=attention_mask,
+            **kwargs,
+        )
+    elif self.layer_type == LAYER_FULL:
+        hidden_states, _ = self.self_attn(
+            normed,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+    else:
+        raise ValueError(f"Unknown layer_type={self.layer_type!r}")
+
+    hidden_states = residual + hidden_states
+
+    residual = hidden_states
+    hidden_states = self.post_attention_layernorm(hidden_states)
+    hidden_states = self.mlp(hidden_states)
+    if isinstance(hidden_states, tuple):
+        hidden_states, _ = hidden_states
+    hidden_states = residual + hidden_states
+
+    return hidden_states
+
+
+# ---------------------------------------------------------------------------
+# Site 2 experimental — shared-rms wrappers (opt-in only)
+# ---------------------------------------------------------------------------
 
 def _wrap_site1_projections(layer: nn.Module, state: SharedRmsState) -> None:
     if layer.layer_type == LAYER_LINEAR:
@@ -86,20 +143,17 @@ def _patched_experts_forward(
 
 
 def _patch_moe_site2(mlp: nn.Module, state: SharedRmsState) -> None:
-    """Patch Qwen3_5MoeSparseMoeBlock for shared-rms Site-2 fusion."""
     se = mlp.shared_expert
     se.gate_proj = SharedRmsLinear(se.gate_proj, state)
     se.up_proj = SharedRmsLinear(se.up_proj, state)
     mlp.shared_expert_gate = SharedRmsLinear(mlp.shared_expert_gate, state)
-
     mlp.gate._shared_rms_state = state
     mlp.gate.forward = types.MethodType(_patched_router_forward, mlp.gate)
-
     mlp.experts._shared_rms_state = state
     mlp.experts.forward = types.MethodType(_patched_experts_forward, mlp.experts)
 
 
-def _patched_decoder_forward(
+def _patched_decoder_forward_site1_and_site2(
     self,
     hidden_states,
     position_embeddings=None,
@@ -113,7 +167,6 @@ def _patched_decoder_forward(
 
     residual = hidden_states
     raw = hidden_states
-
     self._hf_site1_state.begin(raw)
 
     if self.layer_type == LAYER_LINEAR:
@@ -138,13 +191,9 @@ def _patched_decoder_forward(
     hidden_states = residual + hidden_states
 
     residual = hidden_states
-    if hasattr(self, "_hf_site2_state"):
-        raw_moe = hidden_states
-        self._hf_site2_state.begin(raw_moe)
-        hidden_states = self.mlp(raw_moe)
-    else:
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+    raw_moe = hidden_states
+    self._hf_site2_state.begin(raw_moe)
+    hidden_states = self.mlp(raw_moe)
     if isinstance(hidden_states, tuple):
         hidden_states, _ = hidden_states
     hidden_states = residual + hidden_states
@@ -157,28 +206,29 @@ def patch_decoder_layer(
     layer_idx: int,
     *,
     variant: str = "V2",
-    site2: bool = True,
+    site2: bool = False,
 ) -> None:
     """Patch one decoder layer for Site-1 (+ optional Site-2) kernel fusion."""
     validate_decoder_layer(layer, layer_idx)
 
-    site1 = SharedRmsState(_norm_eps(layer.input_layernorm), variant=variant)
-    layer._hf_site1_state = site1
-    _wrap_site1_projections(layer, site1)
-
     if site2:
+        site1 = SharedRmsState(_norm_eps(layer.input_layernorm), variant=variant)
+        layer._hf_site1_state = site1
+        _wrap_site1_projections(layer, site1)
         site2_state = SharedRmsState(_norm_eps(layer.post_attention_layernorm), variant=variant)
         layer._hf_site2_state = site2_state
         _patch_moe_site2(layer.mlp, site2_state)
-
-    layer.forward = types.MethodType(_patched_decoder_forward, layer)
+        layer.forward = types.MethodType(_patched_decoder_forward_site1_and_site2, layer)
+    else:
+        layer._hf_site1_eps = _norm_eps(layer.input_layernorm)
+        layer.forward = types.MethodType(_patched_decoder_forward_site1_only, layer)
 
 
 def apply_hf_kernel_fusion(
     model: nn.Module,
     *,
     variant: str = "V2",
-    site2: bool = True,
+    site2: bool = False,
 ) -> int:
     """Patch all decoder layers on a weight-fused HF model."""
     layers = model.model.layers
