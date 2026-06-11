@@ -8,10 +8,15 @@ Weight fusion absorbs each RMSNorm's gamma vector into the downstream linear wei
 
 ## Prerequisites
 
-- Phase 1 complete: vanilla checkpoint downloaded at `/data/Qwen3.6-35B-A3B-bf16`
-- Phase 1 correctness oracle generated: `phase1/outputs/reference_logits.pt`
-- ~70 GB free disk for the fused checkpoint output
-- Same venv as Phase 1 active: `source phase1/.venv/bin/activate`
+1. Vanilla checkpoint at `/data/Qwen3.6-35B-A3B-bf16` (`bash phase1/download_model.sh`)
+2. Phase 1 correctness oracle — **required for `--check`**:
+   ```bash
+   source phase1/.venv/bin/activate
+   python phase1/run_phase1.py --reference
+   ```
+   Produces `phase1/outputs/reference_logits.pt`
+3. ~70 GB free disk for the fused output
+4. Same venv active: `source phase1/.venv/bin/activate`
 
 ---
 
@@ -47,9 +52,9 @@ python export_fused_weights.py --check
 
 This will:
 1. Load the vanilla BF16 model (~70 GB, takes a few minutes)
-2. Absorb `input_layernorm` gamma into `q_proj`, `k_proj`, `v_proj` for all 64 layers
-3. Absorb `post_attention_layernorm` gamma into every expert's `gate_proj` and `up_proj`
-4. Verify all norm gammas are ~1.0
+2. Fuse site 1 per layer type: `linear_attn.in_proj_*` or `self_attn.q/k/v_proj`
+3. Fuse site 2: `mlp.experts.gate_up_proj`, router, shared expert weights
+4. Verify all `*layernorm.weight` tensors are ~0 (Qwen3.5 norm scale = `1 + weight`)
 5. Run the correctness check against the Phase 1 oracle
 6. Save the fused checkpoint to `/data/Qwen3.6-35B-A3B-bf16-fused`
 
@@ -77,16 +82,16 @@ print('Tensors in index:', len(idx['weight_map']))
 print('Unique shards:', len(set(idx['weight_map'].values())))
 "
 
-# Spot-check that a norm gamma is now 1.0
+# Spot-check that a norm weight is now ~0 (effective scale 1 + weight = 1)
 python -c "
 from safetensors.torch import load_file
-import torch, glob
+import glob
 shards = sorted(glob.glob('/data/Qwen3.6-35B-A3B-bf16-fused/*.safetensors'))
 t = load_file(shards[0], device='cpu')
 key = 'model.layers.0.input_layernorm.weight'
 if key in t:
     w = t[key]
-    print(f'{key}: mean={w.mean():.6f}  std={w.std():.6f}  (expect mean=1.0, std=0.0)')
+    print(f'{key}: mean={w.float().mean():.6f}  std={w.float().std():.6f}  (expect ~0)')
 "
 ```
 

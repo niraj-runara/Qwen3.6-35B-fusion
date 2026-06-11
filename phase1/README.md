@@ -55,10 +55,6 @@ Downloads `Qwen/Qwen3.6-35B-A3B` to `/data/Qwen3.6-35B-A3B-bf16` (~70 GB).
 MODEL_DIR=/nvme/models/Qwen3.6-35B-A3B bash download_model.sh
 ```
 
-**Private / gated model? Pass your HF token:**
-```bash
-HF_TOKEN=hf_xxx bash download_model.sh
-```
 
 **Already downloaded? Just verify the checkpoint:**
 ```bash
@@ -144,6 +140,21 @@ All outputs are written to `phase1/outputs/`:
 
 ---
 
+## Next — fused checkpoint (before Phase 2)
+
+Phase 2 needs a weight-fused copy of the model. After `--reference` has produced `outputs/reference_logits.pt`:
+
+```bash
+source .venv/bin/activate
+cd ../fused-checkpoint
+python export_fused_weights.py --dry-run --check   # verify first
+python export_fused_weights.py --check             # write /data/Qwen3.6-35B-A3B-bf16-fused
+```
+
+See [fused-checkpoint/README.md](../fused-checkpoint/README.md) for details.
+
+---
+
 ## Hardware
 
 | Requirement | Value |
@@ -154,9 +165,6 @@ All outputs are written to `phase1/outputs/`:
 | CUDA | 12.x |
 | Tensor parallelism | Not needed (`--tp 1`) |
 
-> **Why not 2× A100-80G?**  
-> Each A100 has 80 GB. The 70 GB model barely fits on one with almost no KV cache headroom.  
-> A single 96 GB card is the cleaner setup for this phase.
 
 ---
 
