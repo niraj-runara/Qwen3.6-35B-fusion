@@ -43,6 +43,11 @@ Defaults:
 | `PORT` | `30000` |
 | `TP` | `1` |
 | `MEM_FRACTION` | `0.90` |
+| `CONTEXT_LENGTH` | `65536` (covers max benchmark shape 32×2048; model default 262144 OOMs on 96 GB) |
+
+Requires **`sglang>=0.5.10`** per [Qwen3.6 model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B).
+
+Engine benchmark: `--context-length 65536` (same default). HTTP backend inherits `CONTEXT_LENGTH` from `launch_server.sh`.
 
 Health check:
 

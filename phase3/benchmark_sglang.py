@@ -26,8 +26,7 @@ Usage
       --server-url http://127.0.0.1:30000
 
   # Optional: top-1 token check vs Phase 1 oracle prompt
-  python phase3/benchmark_sglang.py --check-logits \\
-      --oracle ../phase1/outputs/reference_logits.pt
+  python phase3/benchmark_sglang.py --check-logits
 """
 
 from __future__ import annotations
@@ -75,6 +74,8 @@ REFERENCE_PROMPT = (
 
 DEFAULT_MODEL_DIR = os.environ.get("MODEL_DIR", "/data/Qwen3.6-35B-A3B-bf16")
 DEFAULT_ORACLE = str(_REPO_ROOT / "phase1/outputs/reference_logits.pt")
+# Max Phase 2/3 grid is 32×2048; avoid 262144 default KV reservation on 96 GB GPUs.
+DEFAULT_CONTEXT_LENGTH = int(os.environ.get("CONTEXT_LENGTH", "65536"))
 _RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
 _SAMPLING_PREFILL = {"max_new_tokens": 1, "temperature": 0.0, "top_p": 1.0}
@@ -131,11 +132,18 @@ def _sync_ms(fn) -> float:
 # ---------------------------------------------------------------------------
 
 class SGLangEngineRunner:
-    def __init__(self, model_dir: str, *, mem_fraction: float = 0.90):
+    def __init__(
+        self,
+        model_dir: str,
+        *,
+        mem_fraction: float = 0.90,
+        context_length: int = DEFAULT_CONTEXT_LENGTH,
+    ):
         from sglang import Engine
 
         self.model_dir = model_dir
         print(f"\n[engine] Loading SGLang Engine from {model_dir} ...")
+        print(f"[engine] context_length={context_length}")
         t0 = time.time()
         self.engine = Engine(
             model_path=model_dir,
@@ -143,6 +151,7 @@ class SGLangEngineRunner:
             dtype="bfloat16",
             trust_remote_code=True,
             mem_fraction_static=mem_fraction,
+            context_length=context_length,
             log_level="error",
         )
         print(f"[engine] Ready in {time.time() - t0:.0f}s")
@@ -383,6 +392,8 @@ def parse_args() -> argparse.Namespace:
                    help="SGLang base URL (--backend http)")
     p.add_argument("--mem-fraction", type=float, default=0.90,
                    help="mem_fraction_static for Engine backend")
+    p.add_argument("--context-length", type=int, default=DEFAULT_CONTEXT_LENGTH,
+                   help="Max context window (default 65536 for 32×2048 grid on 96 GB)")
     p.add_argument("--warmup", type=int, default=WARMUP_ITERS)
     p.add_argument("--measure", type=int, default=MEASURE_ITERS)
     p.add_argument("--check-logits", action="store_true",
@@ -411,6 +422,7 @@ def main() -> None:
     print("=" * 62)
     print(f"  Model    : {model_dir}")
     print(f"  Backend  : {args.backend}")
+    print(f"  Context  : {args.context_length}")
     print(f"  Hidden   : {hidden}")
     print(f"  Vocab    : {out_dim}")
     print(f"  Warmup   : {args.warmup}  |  Measure: {args.measure}")
@@ -421,7 +433,11 @@ def main() -> None:
 
     try:
         if args.backend == "engine":
-            runner = SGLangEngineRunner(model_dir, mem_fraction=args.mem_fraction)
+            runner = SGLangEngineRunner(
+                model_dir,
+                mem_fraction=args.mem_fraction,
+                context_length=args.context_length,
+            )
         else:
             runner = SGLangHttpRunner(args.server_url)
 

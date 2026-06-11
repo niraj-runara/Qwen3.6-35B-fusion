@@ -14,6 +14,9 @@ PORT="${PORT:-30000}"
 HOST="${HOST:-0.0.0.0}"
 TP="${TP:-1}"
 MEM_FRACTION="${MEM_FRACTION:-0.90}"
+# Cap KV cache budget for single-GPU benchmark (max grid: 32×2048 = 65536 tokens).
+# Model default is 262144 — too large on ~96 GB with ~70 GB weights.
+CONTEXT_LENGTH="${CONTEXT_LENGTH:-65536}"
 
 if [[ ! -d "$MODEL_DIR" ]]; then
   echo "ERROR: MODEL_DIR not found: $MODEL_DIR"
@@ -33,8 +36,9 @@ echo "============================================================"
 echo "  Model : $MODEL_DIR"
 echo "  Host  : $HOST"
 echo "  Port  : $PORT"
-echo "  TP    : $TP"
-echo "  dtype : bfloat16"
+echo "  TP      : $TP"
+echo "  Context : $CONTEXT_LENGTH"
+echo "  dtype   : bfloat16"
 echo ""
 echo "Health: curl http://127.0.0.1:${PORT}/health"
 echo "Benchmark (separate terminal):"
@@ -45,7 +49,8 @@ exec python -m sglang.launch_server \
   --model-path "$MODEL_DIR" \
   --host "$HOST" \
   --port "$PORT" \
-  --tp "$TP" \
+  --tp-size "$TP" \
   --dtype bfloat16 \
   --mem-fraction-static "$MEM_FRACTION" \
+  --context-length "$CONTEXT_LENGTH" \
   --trust-remote-code
