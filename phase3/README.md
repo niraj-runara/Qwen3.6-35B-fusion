@@ -1,0 +1,126 @@
+# Phase 3 — Vanilla Qwen3.6 on SGLang
+
+Deploy the **unmodified** BF16 checkpoint on SGLang and record a prefill baseline using the **same CSV schema** as Phase 2. Phase 4 will run the same benchmark against the **fused** checkpoint + kernel hooks and compare speedup.
+
+| Phase | What runs | CSV `benchmark_mode` | Filled columns |
+|-------|-----------|----------------------|----------------|
+| 2 | HF microbench (attn / moe fusion sites) | `checkpoints+kernel` | fused + nonfused |
+| **3** | SGLang full-model prefill (vanilla) | `sglang-vanilla` | **nonfused only** |
+| 4 | SGLang full-model prefill (fused) | `sglang-fused` (planned) | fused + nonfused |
+
+Phase 3 uses `fusion_point=prefill` (end-to-end model forward), not per-layer `attn`/`moe` micro-ops.
+
+---
+
+## Prerequisites
+
+1. Vanilla checkpoint: `/data/Qwen3.6-35B-A3B-bf16`
+2. Phase 1 venv (cu130 PyTorch for Blackwell)
+3. SGLang:
+
+```bash
+source phase1/.venv/bin/activate
+pip install "sglang[all]"
+```
+
+4. ~96 GB GPU (single TP=1 load)
+
+---
+
+## Step 1 — Launch server (optional)
+
+Use this when you want a long-running HTTP server (manual testing, Phase 4 serving).
+
+```bash
+bash phase3/launch_server.sh
+```
+
+Defaults:
+
+| Env var | Default |
+|---------|---------|
+| `MODEL_DIR` | `/data/Qwen3.6-35B-A3B-bf16` |
+| `PORT` | `30000` |
+| `TP` | `1` |
+| `MEM_FRACTION` | `0.90` |
+
+Health check:
+
+```bash
+curl http://127.0.0.1:30000/health
+```
+
+---
+
+## Step 2 — Benchmark
+
+### Option A — In-process Engine (recommended)
+
+Loads the model once, runs the 9-shape prefill sweep, saves CSV. No separate server process.
+
+```bash
+python phase3/benchmark_sglang.py \
+    --model-dir /data/Qwen3.6-35B-A3B-bf16 \
+    --check-logits
+```
+
+### Option B — HTTP (server already running)
+
+```bash
+# terminal 1
+bash phase3/launch_server.sh
+
+# terminal 2
+python phase3/benchmark_sglang.py \
+    --backend http \
+    --server-url http://127.0.0.1:30000 \
+    --model-dir /data/Qwen3.6-35B-A3B-bf16 \
+    --check-logits
+```
+
+### Shape grid (same as Phase 2)
+
+| batch | seq_len |
+|------:|--------:|
+| 1, 8, 32 | 128, 512, 2048 |
+
+### Metrics (same CSV columns as Phase 2)
+
+| Column | Phase 3 |
+|--------|---------|
+| `nonfused_median_ms` / `nonfused_p99_ms` | SGLang prefill latency |
+| `nonfused_throughput` | tokens/s |
+| `nonfused_peak_mem_mb` | peak GPU mem (engine backend) |
+| `fused_*` / `speedup` | NaN (filled in Phase 4) |
+| `max_abs_diff` / `cosine_sim` / `kl_divergence` | NaN (not a fusion-site microbench) |
+
+Output: `phase3/results/benchmark_<timestamp>_sglang-vanilla_prefill_na_full.csv`
+
+---
+
+## Step 3 — Correctness (`--check-logits`)
+
+Compares **top-1 next token** for the Phase 1 reference prompt against `phase1/outputs/reference_logits.pt`. Full logit vector diff is not required for Phase 3 (different kernels than HF eager).
+
+```bash
+python phase1/run_phase1.py --reference   # if oracle missing
+```
+
+---
+
+## Files
+
+| File | Purpose |
+|------|---------|
+| `launch_server.sh` | Start `sglang.launch_server` for vanilla model |
+| `benchmark_sglang.py` | Prefill sweep + CSV export |
+| `results/` | Benchmark CSV outputs |
+
+---
+
+## Next — Phase 4
+
+1. Load `/data/Qwen3.6-35B-A3B-bf16-fused` in SGLang
+2. Apply runtime fusion hooks (same math as `phase2/fusion_bf16.py`)
+3. Re-run `benchmark_sglang.py` with fused config
+4. Compare `nonfused_median_ms` (Phase 3) vs `fused_median_ms` (Phase 4) per shape
