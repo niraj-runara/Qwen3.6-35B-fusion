@@ -163,12 +163,12 @@ def patch_decoder_layer(
     validate_decoder_layer(layer, layer_idx)
 
     site1 = SharedRmsState(_norm_eps(layer.input_layernorm), variant=variant)
-    layer.register_module("_hf_site1_state", site1)
+    layer._hf_site1_state = site1
     _wrap_site1_projections(layer, site1)
 
     if site2:
         site2_state = SharedRmsState(_norm_eps(layer.post_attention_layernorm), variant=variant)
-        layer.register_module("_hf_site2_state", site2_state)
+        layer._hf_site2_state = site2_state
         _patch_moe_site2(layer.mlp, site2_state)
 
     layer.forward = types.MethodType(_patched_decoder_forward, layer)
