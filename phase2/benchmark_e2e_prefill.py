@@ -78,6 +78,7 @@ REFERENCE_PROMPT = (
 
 DEFAULT_UNFUSED_DIR = os.environ.get("MODEL_DIR", "/data/Qwen3.6-35B-A3B-bf16")
 DEFAULT_FUSED_DIR = os.environ.get("FUSED_DIR", "/data/Qwen3.6-35B-A3B-bf16-fused")
+DEFAULT_ORACLE = str(_REPO_ROOT / "phase1/outputs/reference_logits.pt")
 _RESULTS_DIR = _THIS_DIR / "results"
 
 
@@ -504,7 +505,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--test-load", action="store_true", help="Smoke test only")
     p.add_argument("--check-logits", action="store_true",
                    help="Compare next-token id vs Phase 1 oracle (unfused ckpt)")
-    p.add_argument("--oracle", default="../phase1/outputs/reference_logits.pt")
+    p.add_argument("--oracle", default=DEFAULT_ORACLE,
+                   help="Phase 1 reference_logits.pt (default: <repo>/phase1/outputs/...)")
     p.add_argument("--no-save", action="store_true")
     return p.parse_args()
 
