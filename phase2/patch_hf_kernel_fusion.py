@@ -1,40 +1,102 @@
 """
 Runtime kernel fusion for HuggingFace Qwen3_5MoeDecoderLayer (fused checkpoint).
 
-Replaces Site 1 (input_layernorm → token-mixer input projections) with
-FusedRMSNormLinear wrappers and skips the separate input_layernorm in the
-decoder forward.  Site 2 still uses post_attention_layernorm (weight ≈ 0 on
-fused ckpt) + stock MoE forward — MoE kernel fusion remains the Phase 2
-microbenchmark until a full mlp patch lands in Phase 4.
+Site 1 (input_layernorm → token-mixer input projections):
+  - Skip ``input_layernorm``; one shared rms(x) for q/k/v or four ``in_proj_*``.
+
+Site 2 (post_attention_layernorm → MoE block inputs):
+  - Skip ``post_attention_layernorm``; one shared rms(x) for router, experts,
+    shared expert gate/up, and shared-expert gate scalar.
 """
 
 from __future__ import annotations
 
 import types
 
+import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from fusion_bf16 import build_fused_module
+from fusion_bf16 import SharedRmsLinear, SharedRmsState, _norm_eps
 from qwen3_moe_layers import (
     LAYER_FULL,
     LAYER_LINEAR,
-    attn_input_linears,
     validate_decoder_layer,
 )
 
-
-def _patch_linear_attn_site1(linear_attn: nn.Module, fused_projs: nn.ModuleList) -> None:
-    """Swap in_proj_* modules for FusedRMSNormLinear (same call signature)."""
-    names = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
-    for name, fused in zip(names, fused_projs):
-        setattr(linear_attn, name, fused)
+_LINEAR_ATTN_PROJS = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
+_SELF_ATTN_PROJS = ("q_proj", "k_proj", "v_proj")
 
 
-def _patch_self_attn_site1(self_attn: nn.Module, fused_projs: nn.ModuleList) -> None:
-    """Swap q/k/v_proj for FusedRMSNormLinear wrappers."""
-    self_attn.q_proj = fused_projs[0]
-    self_attn.k_proj = fused_projs[1]
-    self_attn.v_proj = fused_projs[2]
+def _wrap_site1_projections(layer: nn.Module, state: SharedRmsState) -> None:
+    if layer.layer_type == LAYER_LINEAR:
+        parent = layer.linear_attn
+        names = _LINEAR_ATTN_PROJS
+    elif layer.layer_type == LAYER_FULL:
+        parent = layer.self_attn
+        names = _SELF_ATTN_PROJS
+    else:
+        raise ValueError(f"Unknown layer_type={layer.layer_type!r}")
+
+    for name in names:
+        linear = getattr(parent, name)
+        setattr(parent, name, SharedRmsLinear(linear, state))
+
+
+def _patched_router_forward(self, hidden_states: torch.Tensor):
+    state: SharedRmsState = self._shared_rms_state
+    hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+    router_logits = state.project_weight(hidden_states, self.weight)
+    router_probs = F.softmax(router_logits, dtype=torch.float, dim=-1)
+    router_top_value, router_indices = torch.topk(router_probs, self.top_k, dim=-1)
+    router_top_value /= router_top_value.sum(dim=-1, keepdim=True)
+    router_top_value = router_top_value.to(router_logits.dtype)
+    return router_logits, router_top_value, router_indices
+
+
+def _patched_experts_forward(
+    self,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+) -> torch.Tensor:
+    state: SharedRmsState = self._shared_rms_state
+    final_hidden_states = torch.zeros_like(hidden_states)
+    with torch.no_grad():
+        expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts)
+        expert_mask = expert_mask.permute(2, 1, 0)
+        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+    for expert_idx in expert_hit:
+        expert_idx = expert_idx[0]
+        if expert_idx == self.num_experts:
+            continue
+        top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+        current_state = hidden_states[token_idx]
+        raw = F.linear(current_state, self.gate_up_proj[expert_idx])
+        state._ensure_ready()
+        fused = raw / state._rms[token_idx]
+        gate, up = fused.chunk(2, dim=-1)
+        current_hidden_states = self.act_fn(gate) * up
+        current_hidden_states = F.linear(current_hidden_states, self.down_proj[expert_idx])
+        current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+        final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+
+    return final_hidden_states
+
+
+def _patch_moe_site2(mlp: nn.Module, state: SharedRmsState) -> None:
+    """Patch Qwen3_5MoeSparseMoeBlock for shared-rms Site-2 fusion."""
+    se = mlp.shared_expert
+    se.gate_proj = SharedRmsLinear(se.gate_proj, state)
+    se.up_proj = SharedRmsLinear(se.up_proj, state)
+    mlp.shared_expert_gate = SharedRmsLinear(mlp.shared_expert_gate, state)
+
+    mlp.gate._shared_rms_state = state
+    mlp.gate.forward = types.MethodType(_patched_router_forward, mlp.gate)
+
+    mlp.experts._shared_rms_state = state
+    mlp.experts.forward = types.MethodType(_patched_experts_forward, mlp.experts)
 
 
 def _patched_decoder_forward(
@@ -46,12 +108,13 @@ def _patched_decoder_forward(
     past_key_values=None,
     **kwargs,
 ):
-    """Decoder forward that feeds raw hidden states into the patched token mixer."""
     if position_embeddings is None:
         position_embeddings = kwargs.pop("position_embeddings", None)
 
     residual = hidden_states
     raw = hidden_states
+
+    self._hf_site1_state.begin(raw)
 
     if self.layer_type == LAYER_LINEAR:
         hidden_states = self.linear_attn(
@@ -75,8 +138,13 @@ def _patched_decoder_forward(
     hidden_states = residual + hidden_states
 
     residual = hidden_states
-    hidden_states = self.post_attention_layernorm(hidden_states)
-    hidden_states = self.mlp(hidden_states)
+    if hasattr(self, "_hf_site2_state"):
+        raw_moe = hidden_states
+        self._hf_site2_state.begin(raw_moe)
+        hidden_states = self.mlp(raw_moe)
+    else:
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
     if isinstance(hidden_states, tuple):
         hidden_states, _ = hidden_states
     hidden_states = residual + hidden_states
@@ -84,33 +152,36 @@ def _patched_decoder_forward(
     return hidden_states
 
 
-def patch_decoder_layer(layer: nn.Module, layer_idx: int, *, variant: str = "V2") -> None:
-    """Patch one decoder layer in-place for Site-1 kernel fusion."""
+def patch_decoder_layer(
+    layer: nn.Module,
+    layer_idx: int,
+    *,
+    variant: str = "V2",
+    site2: bool = True,
+) -> None:
+    """Patch one decoder layer for Site-1 (+ optional Site-2) kernel fusion."""
     validate_decoder_layer(layer, layer_idx)
 
-    fused_projs = nn.ModuleList(
-        build_fused_module(proj, layer.input_layernorm, variant=variant)
-        for proj in attn_input_linears(layer)
-    )
-    layer.register_module("_hf_fusion_site1", fused_projs)
+    site1 = SharedRmsState(_norm_eps(layer.input_layernorm), variant=variant)
+    layer.register_module("_hf_site1_state", site1)
+    _wrap_site1_projections(layer, site1)
 
-    if layer.layer_type == LAYER_LINEAR:
-        _patch_linear_attn_site1(layer.linear_attn, fused_projs)
-    elif layer.layer_type == LAYER_FULL:
-        _patch_self_attn_site1(layer.self_attn, fused_projs)
-    else:
-        raise ValueError(f"Unknown layer_type={layer.layer_type!r}")
+    if site2:
+        site2_state = SharedRmsState(_norm_eps(layer.post_attention_layernorm), variant=variant)
+        layer.register_module("_hf_site2_state", site2_state)
+        _patch_moe_site2(layer.mlp, site2_state)
 
     layer.forward = types.MethodType(_patched_decoder_forward, layer)
 
 
-def apply_hf_kernel_fusion(model: nn.Module, *, variant: str = "V2") -> int:
-    """
-    Patch all decoder layers on a weight-fused HF model.
-
-    Returns the number of layers patched.
-    """
+def apply_hf_kernel_fusion(
+    model: nn.Module,
+    *,
+    variant: str = "V2",
+    site2: bool = True,
+) -> int:
+    """Patch all decoder layers on a weight-fused HF model."""
     layers = model.model.layers
     for i, layer in enumerate(layers):
-        patch_decoder_layer(layer, i, variant=variant)
+        patch_decoder_layer(layer, i, variant=variant, site2=site2)
     return len(layers)

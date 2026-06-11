@@ -402,6 +402,7 @@ def _run_fused_arm(
     attn_implementation: str,
     variant: str,
     use_kernel: bool,
+    site2: bool,
     warmup: int,
     measure: int,
     shapes: list[tuple[int, int]],
@@ -413,8 +414,12 @@ def _run_fused_arm(
 
     with _loaded_model(model_dir, "fused", attn_implementation=attn_implementation) as model:
         if use_kernel:
-            n = apply_hf_kernel_fusion(model, variant=variant)
-            print(f"  Applied Site-1 kernel fusion to {n} decoder layers (variant={variant})")
+            n = apply_hf_kernel_fusion(model, variant=variant, site2=site2)
+            sites = "Site-1+2" if site2 else "Site-1"
+            print(
+                f"  Applied {sites} shared-rms kernel fusion to {n} decoder "
+                f"layers (variant={variant})"
+            )
         else:
             print("  Kernel patch skipped (--no-kernel); weight-fused ckpt only")
 
@@ -503,6 +508,7 @@ def _smoke_test(
     attn_implementation: str,
     variant: str,
     use_kernel: bool,
+    site2: bool,
 ) -> None:
     tokenizer = _load_tokenizer(unfused_dir)
     batch, seq_len = 1, 128
@@ -520,7 +526,7 @@ def _smoke_test(
         print("\n[test-load] Fused forward ...")
         with _loaded_model(fused_dir, "fused", attn_implementation=attn_implementation) as model:
             if use_kernel:
-                apply_hf_kernel_fusion(model, variant=variant)
+                apply_hf_kernel_fusion(model, variant=variant, site2=site2)
             dev = _model_device(model)
             ids, mask = _make_inputs(tokenizer, batch, seq_len, dev)
             with torch.no_grad():
@@ -591,6 +597,11 @@ def parse_args() -> argparse.Namespace:
         metavar="B,S",
         help="Subset of shapes to run, e.g. --shapes 32,2048 (default: all 9)",
     )
+    p.add_argument(
+        "--no-site2",
+        action="store_true",
+        help="Site-1 kernel only (skip MoE Site-2 shared-rms patch)",
+    )
     p.add_argument("--warmup", type=int, default=WARMUP_ITERS)
     p.add_argument("--measure", type=int, default=MEASURE_ITERS)
     p.add_argument("--test-load", action="store_true", help="Smoke test only")
@@ -618,6 +629,7 @@ def main() -> None:
     hidden = int(getattr(text_cfg, "hidden_size", 2048))
     out_dim = int(getattr(text_cfg, "vocab_size", 0)) or 0
     use_kernel = not args.no_kernel
+    site2 = not args.no_site2
     shapes = _parse_shapes(args.shapes)
 
     print("=" * 62)
@@ -625,7 +637,10 @@ def main() -> None:
     print("=" * 62)
     print(f"  Unfused  : {args.unfused_dir}")
     print(f"  Fused    : {args.fused_dir}")
-    print(f"  Kernel   : {'Site-1 ' + args.variant if use_kernel else 'disabled (weights only)'}")
+    kernel_desc = "disabled (weights only)"
+    if use_kernel:
+        kernel_desc = f"Site-1{'+2' if site2 else ''} {args.variant} shared-rms"
+    print(f"  Kernel   : {kernel_desc}")
     print(f"  Attn     : {args.attn_implementation}")
     print(f"  Hidden   : {hidden}")
     print(f"  Vocab    : {out_dim}")
@@ -639,6 +654,7 @@ def main() -> None:
             attn_implementation=args.attn_implementation,
             variant=args.variant,
             use_kernel=use_kernel,
+            site2=site2,
         )
         return
 
@@ -672,6 +688,7 @@ def main() -> None:
         attn_implementation=args.attn_implementation,
         variant=args.variant,
         use_kernel=use_kernel,
+        site2=site2,
         warmup=args.warmup,
         measure=args.measure,
         shapes=shapes,

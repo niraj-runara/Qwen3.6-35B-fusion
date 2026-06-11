@@ -117,7 +117,7 @@ python phase2/benchmark_e2e_prefill.py \
 | `--check-logits` | Top-1 token check vs Phase 1 oracle on unfused ckpt |
 | `--no-save` | Skip CSV under `phase2/results/` |
 
-E2E speedup is **diluted** vs the microbenchmark above — fusion is only Site 1 (attn input projections) in this script; MoE Site 2 still uses stock HF forward. Compare with `phase3/benchmark_sglang.py` for vanilla SGLang prefill baseline.
+E2E speedup is **diluted** vs the microbenchmark above — both Site 1 (attn) and Site 2 (MoE) use shared-rms kernel fusion by default; pass `--no-site2` for Site-1 only. Compare with `phase3/benchmark_sglang.py` for vanilla SGLang prefill baseline.
 
 Checkpoints load **one at a time** (~65 GB each on a 96 GB GPU). The script uses a context manager that strips accelerate hooks and drops all references before loading the next checkpoint.
 

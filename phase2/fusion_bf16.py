@@ -48,6 +48,88 @@ def _rms(x_2d: torch.Tensor, eps: float) -> torch.Tensor:
     ).to(x_2d.dtype)
 
 
+def _norm_eps(norm: nn.Module) -> float:
+    return float(
+        getattr(norm, "variance_epsilon", None)
+        or getattr(norm, "eps", None)
+        or 1e-6
+    )
+
+
+# ---------------------------------------------------------------------------
+# Shared per-layer RMS (E2E / full decoder patch)
+# ---------------------------------------------------------------------------
+
+class Site1RmsState:
+    """
+    One rms(x) per decoder layer, shared by all Site-1 input projections.
+
+    V2 kicks rms off on a side stream in ``begin()`` so the first matmul can
+    overlap with the reduction; ``project()`` waits once before the first divide.
+    """
+
+    def __init__(self, eps: float, *, variant: str = "V2"):
+        self.eps = eps
+        self.variant = variant
+        self._side_stream = (
+            torch.cuda.Stream()
+            if variant == "V2" and torch.cuda.is_available()
+            else None
+        )
+        self._rms: torch.Tensor | None = None
+        self._ready = False
+
+    def begin(self, x: torch.Tensor) -> None:
+        """Start (or compute) shared rms for this layer forward."""
+        self._ready = False
+        x_2d = x.reshape(-1, x.size(-1))
+        if self._side_stream is not None:
+            with torch.cuda.stream(self._side_stream):
+                self._rms = _rms(x_2d, self.eps)
+        else:
+            self._rms = _rms(x_2d, self.eps)
+
+    def _ensure_ready(self) -> None:
+        if not self._ready:
+            if self._side_stream is not None:
+                torch.cuda.current_stream().wait_stream(self._side_stream)
+            self._ready = True
+
+    def project(self, x: torch.Tensor, linear: nn.Module) -> torch.Tensor:
+        """fused-weight linear(x) / rms(x) using the layer-shared rms."""
+        orig_shape = x.shape
+        x_2d = x.reshape(-1, x.size(-1))
+        raw = _linear_forward(linear, x_2d)
+        self._ensure_ready()
+        out = raw / self._rms
+        return out.reshape(orig_shape[:-1] + (out.size(-1),))
+
+    def project_weight(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        """F.linear(x, weight) / rms(x) for nn.Parameter routers / expert stacks."""
+        orig_shape = x.shape
+        x_2d = x.reshape(-1, x.size(-1))
+        raw = torch.nn.functional.linear(x_2d, weight)
+        self._ensure_ready()
+        out = raw / self._rms
+        return out.reshape(orig_shape[:-1] + (out.size(-1),))
+
+
+# Site 1 and Site 2 use the same shared-rms helper.
+SharedRmsState = Site1RmsState
+
+
+class SharedRmsLinear(nn.Module):
+    """Wrap one fused-weight linear; divides by the layer's shared rms state."""
+
+    def __init__(self, linear: nn.Module, state: Site1RmsState):
+        super().__init__()
+        self.linear = linear
+        self.state = state
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.state.project(x, self.linear)
+
+
 # ---------------------------------------------------------------------------
 # V1 — sequential (safe on all GPUs)
 # ---------------------------------------------------------------------------
