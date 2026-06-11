@@ -119,7 +119,11 @@ python phase2/benchmark_e2e_prefill.py \
 
 E2E speedup is **diluted** vs the microbenchmark above — fusion is only Site 1 (attn input projections) in this script; MoE Site 2 still uses stock HF forward. Compare with `phase3/benchmark_sglang.py` for vanilla SGLang prefill baseline.
 
-Checkpoints load **one at a time** (~65 GB each on a 96 GB GPU). The script uses a context manager that strips accelerate hooks and drops all references before loading the next checkpoint. After unfused teardown you should see `[after free] GPU 0: ~0.x GB` — not ~64 GB.
+Checkpoints load **one at a time** (~65 GB each on a 96 GB GPU). The script uses a context manager that strips accelerate hooks and drops all references before loading the next checkpoint.
+
+**Attention backend:** default is `sdpa` (not `eager`). With ~65 GB weights, eager attention OOMs on large shapes (e.g. `batch=32, seq=2048`) because it materializes full `[batch, heads, seq, seq]` attention matrices. `--check-logits` still uses `eager` to match the Phase 1 oracle. Use `--attn-implementation eager` only if you accept OOM/skips on big shapes.
+
+If a shape still OOMs, it is skipped (NaN in CSV) and the sweep continues. Re-run a single shape with `--shapes 32,2048`.
 
 ---
 

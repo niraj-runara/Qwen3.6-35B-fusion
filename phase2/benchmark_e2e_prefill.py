@@ -212,12 +212,17 @@ def _compare_logits(
     )
 
 
-def _load_model(model_dir: str, label: str) -> nn.Module:
+def _load_model(
+    model_dir: str,
+    label: str,
+    *,
+    attn_implementation: str = "sdpa",
+) -> nn.Module:
     from transformers import AutoModelForCausalLM
 
     if not os.path.isdir(model_dir):
         raise FileNotFoundError(f"Checkpoint not found: {model_dir}")
-    print(f"\nLoading {label} from {model_dir} ...")
+    print(f"\nLoading {label} from {model_dir} (attn={attn_implementation}) ...")
     t0 = time.time()
     # Pin to a single GPU so sequential unfused→fused loads reuse the same
     # ~65 GB pool.  device_map="auto" can CPU-offload when it sees cached
@@ -227,7 +232,7 @@ def _load_model(model_dir: str, label: str) -> nn.Module:
         torch_dtype=DTYPE,
         device_map="cuda:0",
         trust_remote_code=True,
-        attn_implementation="eager",
+        attn_implementation=attn_implementation,
         low_cpu_mem_usage=True,
     )
     model.eval()
@@ -272,15 +277,69 @@ def _cuda_gc(label: str = "after free", *, quiet: bool = False) -> None:
 
 
 @contextmanager
-def _loaded_model(model_dir: str, label: str):
+def _loaded_model(model_dir: str, label: str, *, attn_implementation: str = "sdpa"):
     """Load one full checkpoint; guaranteed GPU release on exit."""
-    model = _load_model(model_dir, label)
+    model = _load_model(model_dir, label, attn_implementation=attn_implementation)
     try:
         yield model
     finally:
         _release_model(model)
         del model
         _cuda_gc(label)
+
+
+def _is_oom(exc: BaseException) -> bool:
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    return "out of memory" in str(exc).lower()
+
+
+def _benchmark_one_shape(
+    model: nn.Module,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    *,
+    warmup: int,
+    measure: int,
+    batch: int,
+    seq_len: int,
+) -> tuple[list[float], float, torch.Tensor | None]:
+    """
+    Run latency + peak-mem + logits for one shape.
+
+    Returns (latencies, peak_mem_mb, last_token_logits).  On OOM, returns
+    empty latencies, NaN peak mem, and None logits (caller records skip).
+    """
+    try:
+        _cuda_gc(quiet=True)
+        print("  Measuring prefill latency ...")
+        latencies = _measure_prefill_latency(
+            model, input_ids, attention_mask, warmup=warmup, measure=measure
+        )
+
+        print("  Measuring peak GPU memory ...")
+        try:
+            peak_mem = _measure_peak_memory_mb(model, input_ids, attention_mask)
+        except Exception as exc:
+            if _is_oom(exc):
+                raise
+            print(f"  [warn] peak memory failed: {exc}")
+            peak_mem = float("nan")
+
+        print("  Caching last-token logits for numerical compare ...")
+        logits = _last_token_logits(model, input_ids, attention_mask)
+        return latencies, peak_mem, logits
+
+    except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
+        if not _is_oom(exc):
+            raise
+        print(
+            f"  [OOM] Skipping batch={batch} seq_len={seq_len} "
+            f"(activation memory exceeds free GPU after ~65 GB weights)."
+        )
+        print(f"         {exc}")
+        _cuda_gc("after OOM")
+        return [], float("nan"), None
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +350,7 @@ def _run_unfused_arm(
     model_dir: str,
     tokenizer,
     *,
+    attn_implementation: str,
     warmup: int,
     measure: int,
     shapes: list[tuple[int, int]],
@@ -299,7 +359,7 @@ def _run_unfused_arm(
     peak_mem: dict[tuple[int, int], float] = {}
     logits_cache: dict[tuple[int, int], torch.Tensor] = {}
 
-    with _loaded_model(model_dir, "unfused") as model:
+    with _loaded_model(model_dir, "unfused", attn_implementation=attn_implementation) as model:
         device = _model_device(model)
         for batch, seq_len in shapes:
             print(f"\n{'=' * 62}")
@@ -309,23 +369,24 @@ def _run_unfused_arm(
             input_ids, attention_mask = _make_inputs(tokenizer, batch, seq_len, device)
             key = (batch, seq_len)
 
-            print("  Measuring prefill latency ...")
-            latencies[key] = _measure_prefill_latency(
-                model, input_ids, attention_mask, warmup=warmup, measure=measure
+            lat, peak, logits = _benchmark_one_shape(
+                model,
+                input_ids,
+                attention_mask,
+                warmup=warmup,
+                measure=measure,
+                batch=batch,
+                seq_len=seq_len,
             )
+            latencies[key] = lat
+            peak_mem[key] = peak
+            if logits is not None:
+                logits_cache[key] = logits
 
-            print("  Measuring peak GPU memory ...")
-            try:
-                peak_mem[key] = _measure_peak_memory_mb(model, input_ids, attention_mask)
-            except Exception as exc:
-                print(f"  [warn] peak memory failed: {exc}")
-                peak_mem[key] = float("nan")
-
-            print("  Caching last-token logits for numerical compare ...")
-            logits_cache[key] = _last_token_logits(model, input_ids, attention_mask)
-
-            med = statistics.median(latencies[key])
-            print(f"  Latency (median ms): {med:.4f}")
+            if lat:
+                print(f"  Latency (median ms): {statistics.median(lat):.4f}")
+            else:
+                print("  Latency (median ms): skipped (OOM)")
             print(f"  Peak mem (MB):       {peak_mem[key]:.1f}")
 
             del input_ids, attention_mask
@@ -338,6 +399,7 @@ def _run_fused_arm(
     model_dir: str,
     tokenizer,
     *,
+    attn_implementation: str,
     variant: str,
     use_kernel: bool,
     warmup: int,
@@ -349,7 +411,7 @@ def _run_fused_arm(
     peak_mem: dict[tuple[int, int], float] = {}
     numerical: dict[tuple[int, int], tuple[float, float, float]] = {}
 
-    with _loaded_model(model_dir, "fused") as model:
+    with _loaded_model(model_dir, "fused", attn_implementation=attn_implementation) as model:
         if use_kernel:
             n = apply_hf_kernel_fusion(model, variant=variant)
             print(f"  Applied Site-1 kernel fusion to {n} decoder layers (variant={variant})")
@@ -365,29 +427,29 @@ def _run_fused_arm(
             input_ids, attention_mask = _make_inputs(tokenizer, batch, seq_len, device)
             key = (batch, seq_len)
 
-            print("  Measuring prefill latency ...")
-            latencies[key] = _measure_prefill_latency(
-                model, input_ids, attention_mask, warmup=warmup, measure=measure
+            lat, peak, fused_logits = _benchmark_one_shape(
+                model,
+                input_ids,
+                attention_mask,
+                warmup=warmup,
+                measure=measure,
+                batch=batch,
+                seq_len=seq_len,
             )
+            latencies[key] = lat
+            peak_mem[key] = peak
 
-            print("  Measuring peak GPU memory ...")
-            try:
-                peak_mem[key] = _measure_peak_memory_mb(model, input_ids, attention_mask)
-            except Exception as exc:
-                print(f"  [warn] peak memory failed: {exc}")
-                peak_mem[key] = float("nan")
-
-            print("  Comparing logits vs unfused arm ...")
-            fused_logits = _last_token_logits(model, input_ids, attention_mask)
-            if key in unfused_logits:
+            if fused_logits is not None and key in unfused_logits:
                 numerical[key] = _compare_logits(fused_logits, unfused_logits[key])
             else:
                 numerical[key] = (float("nan"), float("nan"), float("nan"))
 
-            med = statistics.median(latencies[key])
-            print(f"  Latency (median ms): {med:.4f}")
+            if lat:
+                print(f"  Latency (median ms): {statistics.median(lat):.4f}")
+            else:
+                print("  Latency (median ms): skipped (OOM)")
             print(f"  Peak mem (MB):       {peak_mem[key]:.1f}")
-            if key in numerical:
+            if key in numerical and fused_logits is not None:
                 md, cs, kl = numerical[key]
                 print(f"  max|diff|: {md:.4f}  cosine: {cs:.6f}  KL: {kl:.2e}")
 
@@ -422,10 +484,23 @@ def _merge_results(
     return results
 
 
+def _parse_shapes(specs: list[str] | None) -> list[tuple[int, int]]:
+    if not specs:
+        return list(_BATCH_SEQ_PAIRS)
+    out: list[tuple[int, int]] = []
+    for spec in specs:
+        parts = spec.split(",")
+        if len(parts) != 2:
+            raise ValueError(f"Invalid --shapes entry {spec!r}; use BATCH,SEQ_LEN e.g. 32,2048")
+        out.append((int(parts[0]), int(parts[1])))
+    return out
+
+
 def _smoke_test(
     unfused_dir: str,
     fused_dir: str,
     *,
+    attn_implementation: str,
     variant: str,
     use_kernel: bool,
 ) -> None:
@@ -434,7 +509,7 @@ def _smoke_test(
 
     def _run_unfused() -> torch.Tensor:
         print("\n[test-load] Unfused forward ...")
-        with _loaded_model(unfused_dir, "unfused") as model:
+        with _loaded_model(unfused_dir, "unfused", attn_implementation=attn_implementation) as model:
             dev = _model_device(model)
             ids, mask = _make_inputs(tokenizer, batch, seq_len, dev)
             with torch.no_grad():
@@ -443,7 +518,7 @@ def _smoke_test(
 
     def _run_fused(nf_logits: torch.Tensor) -> None:
         print("\n[test-load] Fused forward ...")
-        with _loaded_model(fused_dir, "fused") as model:
+        with _loaded_model(fused_dir, "fused", attn_implementation=attn_implementation) as model:
             if use_kernel:
                 apply_hf_kernel_fusion(model, variant=variant)
             dev = _model_device(model)
@@ -468,7 +543,8 @@ def check_logits_oracle(model_dir: str, oracle_path: Path) -> bool:
     oracle_top1 = int(oracle.argmax().item())
 
     tokenizer = _load_tokenizer(model_dir)
-    with _loaded_model(model_dir, "oracle-check") as model:
+    # Phase 1 oracle was captured with eager attention — match that here.
+    with _loaded_model(model_dir, "oracle-check", attn_implementation="eager") as model:
         dev = _model_device(model)
         ids = tokenizer(REFERENCE_PROMPT, return_tensors="pt")["input_ids"].to(dev)
         mask = torch.ones_like(ids)
@@ -500,6 +576,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Fused arm: weight-fused ckpt only (no Site-1 runtime kernel patch)",
     )
+    p.add_argument(
+        "--attn-implementation",
+        choices=("sdpa", "eager", "flash_attention_2"),
+        default="sdpa",
+        help=(
+            "Attention backend for the benchmark sweep (default sdpa). "
+            "eager OOMs on large shapes with ~65 GB weights on a 96 GB GPU."
+        ),
+    )
+    p.add_argument(
+        "--shapes",
+        nargs="+",
+        metavar="B,S",
+        help="Subset of shapes to run, e.g. --shapes 32,2048 (default: all 9)",
+    )
     p.add_argument("--warmup", type=int, default=WARMUP_ITERS)
     p.add_argument("--measure", type=int, default=MEASURE_ITERS)
     p.add_argument("--test-load", action="store_true", help="Smoke test only")
@@ -527,6 +618,7 @@ def main() -> None:
     hidden = int(getattr(text_cfg, "hidden_size", 2048))
     out_dim = int(getattr(text_cfg, "vocab_size", 0)) or 0
     use_kernel = not args.no_kernel
+    shapes = _parse_shapes(args.shapes)
 
     print("=" * 62)
     print("Phase 2 E2E — HF full-model prefill benchmark")
@@ -534,15 +626,17 @@ def main() -> None:
     print(f"  Unfused  : {args.unfused_dir}")
     print(f"  Fused    : {args.fused_dir}")
     print(f"  Kernel   : {'Site-1 ' + args.variant if use_kernel else 'disabled (weights only)'}")
+    print(f"  Attn     : {args.attn_implementation}")
     print(f"  Hidden   : {hidden}")
     print(f"  Vocab    : {out_dim}")
     print(f"  Warmup   : {args.warmup}  |  Measure: {args.measure}")
-    print(f"  Shapes   : {len(_BATCH_SEQ_PAIRS)} configs")
+    print(f"  Shapes   : {len(shapes)} configs")
 
     if args.test_load:
         _smoke_test(
             args.unfused_dir,
             args.fused_dir,
+            attn_implementation=args.attn_implementation,
             variant=args.variant,
             use_kernel=use_kernel,
         )
@@ -556,7 +650,6 @@ def main() -> None:
         print("[check-logits] PASS")
 
     tokenizer = _load_tokenizer(args.unfused_dir)
-    shapes = list(_BATCH_SEQ_PAIRS)
 
     print(f"\n{'─' * 62}")
     print("Arm 1/2 — unfused checkpoint (sequential load)")
@@ -564,6 +657,7 @@ def main() -> None:
     nf_lat, nf_mem, nf_logits = _run_unfused_arm(
         args.unfused_dir,
         tokenizer,
+        attn_implementation=args.attn_implementation,
         warmup=args.warmup,
         measure=args.measure,
         shapes=shapes,
@@ -575,6 +669,7 @@ def main() -> None:
     f_lat, f_mem, numerical = _run_fused_arm(
         args.fused_dir,
         tokenizer,
+        attn_implementation=args.attn_implementation,
         variant=args.variant,
         use_kernel=use_kernel,
         warmup=args.warmup,
