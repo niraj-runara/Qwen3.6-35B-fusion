@@ -11,13 +11,12 @@ This is the "unfused" half of the Phase 2 comparison.  Running this
 produces a CSV in the benchmark_reference format so Phase 1 and Phase 2
 results are directly comparable.
 
-Fusion sites benchmarked:
-  attn  input_layernorm + attention input projection
-        full_attention layers: self_attn.q_proj
-        linear_attention layers: linear_attn.in_proj_qkv  (Gated DeltaNet)
-  moe   post_attention_layernorm + expert gate projection
-        Qwen3.5 MoE: experts.gate_up_proj[expert_idx] gate half
-        legacy MoE:  experts[expert_idx].gate_proj
+Fusion sites (Qwen3_5MoeDecoderLayer — same class as Qwen3.6-35B-A3B):
+  attn  input_layernorm + token-mixer input projection
+        linear_attention (3 of 4 layers): linear_attn.in_proj_qkv
+        full_attention   (1 of 4 layers): self_attn.q_proj
+  moe   post_attention_layernorm + gate half of mlp.experts.gate_up_proj[expert_idx]
+        (Qwen3_5MoeExperts stores gate+up as one fused [E, 2*I, H] tensor)
 
 Usage
 ─────
@@ -87,6 +86,11 @@ _BATCH_SEQ_PAIRS = [
 
 _RESULTS_DIR = _THIS_DIR / "outputs" / "benchmark_layer"
 
+# Qwen3.6-35B-A3B decoder layer types (config.layer_types, 3:1 hybrid stack)
+_LAYER_LINEAR = "linear_attention"
+_LAYER_FULL   = "full_attention"
+_DECODER_CLS  = "Qwen3_5MoeDecoderLayer"
+
 
 # ---------------------------------------------------------------------------
 # Unfused benchmark wrapper
@@ -105,18 +109,24 @@ class _UnfusedNormLinear(nn.Module):
         return out[0] if isinstance(out, tuple) else out
 
 
-class _WeightLinear(nn.Module):
-    """nn.Linear-compatible wrapper for a standalone weight matrix."""
+class _ExpertGateProj(nn.Module):
+    """
+    Gate projection for one expert in Qwen3_5MoeExperts.
 
-    def __init__(self, weight: torch.Tensor, bias: torch.Tensor | None = None):
+    Experts store gate and up weights together in gate_up_proj [E, 2*I, H];
+    the gate matrix is the first I rows for each expert.
+    """
+
+    def __init__(self, gate_up_proj: torch.Tensor, expert_idx: int):
         super().__init__()
-        self.register_buffer("weight", weight)
-        if bias is not None:
-            self.register_buffer("bias", bias)
+        intermediate = gate_up_proj.shape[1] // 2
+        self.weight = nn.Parameter(
+            gate_up_proj[expert_idx, :intermediate, :].detach().clone(),
+            requires_grad=False,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        bias = getattr(self, "bias", None)
-        return torch.nn.functional.linear(x, self.weight, bias)
+        return torch.nn.functional.linear(x, self.weight)
 
 
 # ---------------------------------------------------------------------------
@@ -145,77 +155,53 @@ def _extract_layer(model: nn.Module, layer_idx: int) -> nn.Module:
     del model
     gc.collect()
     torch.cuda.empty_cache()
-    return layer.to(device=DEVICE, dtype=DTYPE).eval()
+    layer = layer.to(device=DEVICE, dtype=DTYPE).eval()
 
-
-def _get_norm_eps(norm: nn.Module) -> float:
-    return float(
-        getattr(norm, "variance_epsilon", None)
-        or getattr(norm, "eps", None)
-        or 1e-6
-    )
+    if type(layer).__name__ != _DECODER_CLS:
+        raise TypeError(
+            f"Expected {_DECODER_CLS} at model.layers[{layer_idx}], "
+            f"got {type(layer).__name__}"
+        )
+    return layer
 
 
 # ---------------------------------------------------------------------------
-# Build benchmark modules
+# Build benchmark modules — Qwen3_5MoeDecoderLayer fusion sites
 # ---------------------------------------------------------------------------
 
-def _layer_type(layer: nn.Module) -> str:
-    return str(getattr(layer, "layer_type", "full_attention"))
-
-
-def _resolve_attn_linear(layer: nn.Module) -> nn.Module:
-    """Primary attention input projection for fusion site 1."""
-    if hasattr(layer, "self_attn"):
-        return layer.self_attn.q_proj
-    if hasattr(layer, "linear_attn"):
+def _attn_input_proj(layer: nn.Module) -> nn.Module:
+    """Token-mixer input linear for this layer's hybrid attention type."""
+    if layer.layer_type == _LAYER_LINEAR:
         return layer.linear_attn.in_proj_qkv
-    raise AttributeError(
-        f"{type(layer).__name__} has neither self_attn nor linear_attn "
-        f"(layer_type={_layer_type(layer)})"
-    )
+    if layer.layer_type == _LAYER_FULL:
+        return layer.self_attn.q_proj
+    raise ValueError(f"Unknown layer_type={layer.layer_type!r}")
 
 
-def _resolve_moe_gate_linear(layer: nn.Module, expert_idx: int = 0) -> nn.Module:
-    """Expert gate projection for fusion site 2."""
-    mlp = layer.mlp
-    experts = getattr(mlp, "experts", None)
-
-    if experts is not None:
-        gate_up = getattr(experts, "gate_up_proj", None)
-        if isinstance(gate_up, torch.Tensor) and gate_up.ndim == 3:
-            mid = gate_up.shape[1] // 2
-            return _WeightLinear(gate_up[expert_idx, :mid, :])
-
-        if hasattr(experts, "__getitem__"):
-            try:
-                expert = experts[expert_idx]
-            except (IndexError, TypeError) as exc:
-                raise RuntimeError(
-                    f"expert_idx={expert_idx} out of range for {type(experts).__name__}"
-                ) from exc
-            if hasattr(expert, "gate_proj"):
-                return expert.gate_proj
-
-    if hasattr(mlp, "gate_proj"):
-        return mlp.gate_proj
-
-    raise RuntimeError(
-        f"No gate projection found under mlp ({type(mlp).__name__}) — is this a MoE layer?"
-    )
+def _moe_gate_proj(layer: nn.Module, expert_idx: int) -> nn.Module:
+    """Gate projection for one routed expert (Qwen3_5MoeExperts.gate_up_proj)."""
+    gate_up = layer.mlp.experts.gate_up_proj
+    num_experts = gate_up.shape[0]
+    if not 0 <= expert_idx < num_experts:
+        raise IndexError(f"expert_idx={expert_idx} out of range (num_experts={num_experts})")
+    return _ExpertGateProj(gate_up, expert_idx)
 
 
 def _build_attn_module(layer: nn.Module) -> _UnfusedNormLinear:
-    """input_layernorm + attention input projection."""
-    return _UnfusedNormLinear(layer.input_layernorm, _resolve_attn_linear(layer))
+    return _UnfusedNormLinear(layer.input_layernorm, _attn_input_proj(layer))
 
 
 def _build_moe_module(layer: nn.Module, expert_idx: int = 0) -> _UnfusedNormLinear:
-    """post_attention_layernorm + expert gate projection."""
     return _UnfusedNormLinear(
         layer.post_attention_layernorm,
-        _resolve_moe_gate_linear(layer, expert_idx=expert_idx),
+        _moe_gate_proj(layer, expert_idx),
     )
+
+
+def _attn_site_label(layer: nn.Module) -> str:
+    if layer.layer_type == _LAYER_LINEAR:
+        return "input_layernorm + linear_attn.in_proj_qkv"
+    return "input_layernorm + self_attn.q_proj"
 
 
 # ---------------------------------------------------------------------------
@@ -226,18 +212,9 @@ def _benchmark_site(
     module: nn.Module,
     site_label: str,
     layer_idx: int,
+    hidden_dim: int,
 ) -> list[ShapeResult]:
     results: list[ShapeResult] = []
-
-    # Infer hidden_dim from first 2-D weight
-    hidden_dim = None
-    for _, p in module.named_parameters():
-        if p.ndim == 2 and "norm" not in _.lower():
-            hidden_dim = p.shape[1]
-            print(f"  hidden_dim={hidden_dim} (from '{_}' {tuple(p.shape)})")
-            break
-    if hidden_dim is None:
-        raise ValueError("Cannot infer hidden_dim from module")
 
     module = module.to(DEVICE, dtype=DTYPE).eval()
 
@@ -377,11 +354,10 @@ def main() -> None:
     layer = _extract_layer(model, args.layer_idx)
     hidden_size = layer.hidden_size
 
-    print(f"  Layer type: {_layer_type(layer)}")
-    if _layer_type(layer) == "linear_attention":
-        print("  Attn site : input_layernorm + linear_attn.in_proj_qkv")
-    else:
-        print("  Attn site : input_layernorm + self_attn.q_proj")
+    print(f"  Layer type : {layer.layer_type}")
+    print(f"  Hidden size: {hidden_size}")
+    print(f"  Attn site  : {_attn_site_label(layer)}")
+    print(f"  MoE site   : post_attention_layernorm + mlp.experts.gate_up_proj[0] gate half")
 
     sites = ["attn", "moe"] if args.site == "all" else [args.site]
 
@@ -410,7 +386,12 @@ def main() -> None:
         print(f"{'#' * 60}")
 
         module = _build_attn_module(layer) if site == "attn" else _build_moe_module(layer)
-        results = _benchmark_site(module, site_label=site, layer_idx=args.layer_idx)
+        results = _benchmark_site(
+            module,
+            site_label=site,
+            layer_idx=args.layer_idx,
+            hidden_dim=hidden_size,
+        )
         all_results[site] = results
         _print_vanilla_table(results, site_label=site)
 
