@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=70.0.0,<82.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen-sglang-fusion"
+version = "0.1.0"
+description = "Qwen3.6 weight+kernel fusion plugin for SGLang"
+requires-python = ">=3.11"
+
+[project.entry-points."sglang.srt.plugins"]
+qwen_fusion = "sglang_fusion_plugin:activate"
+
+[tool.setuptools]
+py-modules = ["sglang_fusion_plugin", "patch_sglang_kernel_fusion"]

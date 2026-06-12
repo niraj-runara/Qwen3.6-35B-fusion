@@ -1,0 +1,47 @@
+# macOS
+.DS_Store
+phase2/.DS_Store
+phase2/results/.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Large local artifacts (checkpoints, traces — keep under /data on GPU hosts)
+*.pt
+*.bin
+*.safetensors
+profiler_trace/
+
+# Editable plugin install (phase4)
+qwen_sglang_fusion.egg-info/
