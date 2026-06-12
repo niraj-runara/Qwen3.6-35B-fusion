@@ -31,7 +31,7 @@ print('sglang.srt.plugins: qwen_fusion OK')
 "
 
 echo ""
-echo "=== Fused checkpoint config (SGLang architectures) ==="
+echo "=== Fused checkpoint config (copy vanilla metadata for SGLang) ==="
 VANILLA_DIR="$VANILLA_DIR" FUSED_DIR="$FUSED_DIR" python -c "
 from patch_sglang_kernel_fusion import sync_fused_config_architectures
 import os

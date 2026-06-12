@@ -28,25 +28,23 @@ logger = logging.getLogger(__name__)
 
 
 def sync_fused_config_architectures(vanilla_dir: str | Path, fused_dir: str | Path) -> bool:
-    """Copy ``architectures`` from vanilla config so SGLang recognizes the fused ckpt."""
-    vanilla_cfg = Path(vanilla_dir) / "config.json"
-    fused_cfg = Path(fused_dir) / "config.json"
-    if not vanilla_cfg.is_file() or not fused_cfg.is_file():
-        return False
+    """Copy vanilla config metadata so SGLang loads fused ckpt like Phase 3 vanilla."""
+    import shutil
 
-    src = json.loads(vanilla_cfg.read_text())
-    dst = json.loads(fused_cfg.read_text())
-    target = src.get("architectures")
-    if not target:
-        return False
-    if dst.get("architectures") == target:
-        return False
-
-    old = dst.get("architectures")
-    dst["architectures"] = target
-    fused_cfg.write_text(json.dumps(dst, indent=2) + "\n")
-    print(f"[config] {fused_cfg.name} architectures: {old} -> {target}")
-    return True
+    vanilla_dir = Path(vanilla_dir)
+    fused_dir = Path(fused_dir)
+    changed = False
+    for fname in ("config.json", "generation_config.json"):
+        src = vanilla_dir / fname
+        dst = fused_dir / fname
+        if not src.is_file():
+            continue
+        if dst.is_file() and src.read_bytes() == dst.read_bytes():
+            continue
+        shutil.copy2(src, dst)
+        print(f"[config] copied {src.name} from vanilla -> {dst}")
+        changed = True
+    return changed
 
 
 _LAYER_LIST_PATHS = (

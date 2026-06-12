@@ -27,7 +27,7 @@ source phase1/.venv/bin/activate
 bash phase4/setup_fusion_plugin.sh
 ```
 
-The benchmark also syncs `architectures` from vanilla → fused at startup if needed.
+The benchmark also copies vanilla `config.json` / `generation_config.json` into the fused dir at startup if they differ.
 
 ---
 
