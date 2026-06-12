@@ -26,15 +26,26 @@ from qwen3_moe_layers import DECODER_CLS  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
+# Small HF metadata files SGLang needs for multimodal Qwen3.6 (not weight shards).
+_VANILLA_METADATA_FILES = (
+    "config.json",
+    "generation_config.json",
+    "preprocessor_config.json",
+    "video_preprocessor_config.json",
+    "chat_template.jinja",
+    "tokenizer_config.json",
+    "configuration.json",
+)
+
 
 def sync_fused_config_architectures(vanilla_dir: str | Path, fused_dir: str | Path) -> bool:
-    """Copy vanilla config metadata so SGLang loads fused ckpt like Phase 3 vanilla."""
+    """Copy vanilla metadata into fused ckpt so SGLang loads like Phase 3 vanilla."""
     import shutil
 
     vanilla_dir = Path(vanilla_dir)
     fused_dir = Path(fused_dir)
     changed = False
-    for fname in ("config.json", "generation_config.json"):
+    for fname in _VANILLA_METADATA_FILES:
         src = vanilla_dir / fname
         dst = fused_dir / fname
         if not src.is_file():
@@ -42,7 +53,7 @@ def sync_fused_config_architectures(vanilla_dir: str | Path, fused_dir: str | Pa
         if dst.is_file() and src.read_bytes() == dst.read_bytes():
             continue
         shutil.copy2(src, dst)
-        print(f"[config] copied {src.name} from vanilla -> {dst}")
+        print(f"[config] copied {fname} from vanilla -> {dst}")
         changed = True
     return changed
 

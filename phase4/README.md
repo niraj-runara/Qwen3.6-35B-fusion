@@ -27,7 +27,7 @@ source phase1/.venv/bin/activate
 bash phase4/setup_fusion_plugin.sh
 ```
 
-The benchmark also copies vanilla `config.json` / `generation_config.json` into the fused dir at startup if they differ.
+The benchmark also copies vanilla metadata (`config.json`, `preprocessor_config.json`, etc.) into the fused dir at startup if they differ. Weight shards are never touched.
 
 ---
 
