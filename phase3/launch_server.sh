@@ -9,6 +9,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[[ -f "$SCRIPT_DIR/env_sglang.sh" ]] && source "$SCRIPT_DIR/env_sglang.sh"
+
 MODEL_DIR="${MODEL_DIR:-/data/Qwen3.6-35B-A3B-bf16}"
 PORT="${PORT:-30000}"
 HOST="${HOST:-0.0.0.0}"
