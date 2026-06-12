@@ -1,0 +1,10 @@
+run_timestamp_utc,benchmark_mode,fusion_point,variant,load_mode,device,batch,seq_len,hidden,out_dim,fused_median_ms,nonfused_median_ms,speedup,fused_p99_ms,nonfused_p99_ms,fused_throughput,nonfused_throughput,fused_peak_mem_mb,nonfused_peak_mem_mb,max_abs_diff,cosine_sim,kl_divergence
+2026-06-12T00:31:57Z,sglang-vanilla,prefill,n/a,full,cuda:0,1,128,2048,248320,nan,72.44891859591007,nan,nan,88.1972685456276,nan,1766.762050844827,0.0,0.0,nan,nan,nan
+2026-06-12T00:31:57Z,sglang-vanilla,prefill,n/a,full,cuda:0,1,512,2048,248320,nan,80.13333566486835,nan,nan,141.9249065220356,nan,6389.350895628178,0.0,0.0,nan,nan,nan
+2026-06-12T00:31:57Z,sglang-vanilla,prefill,n/a,full,cuda:0,1,2048,2048,248320,nan,74.13846254348755,nan,nan,113.36520314216614,nan,27623.98800485916,0.0,0.0,nan,nan,nan
+2026-06-12T00:31:57Z,sglang-vanilla,prefill,n/a,full,cuda:0,8,128,2048,248320,nan,75.13422332704067,nan,nan,103.53235527873039,nan,13628.942373474489,0.0,0.0,nan,nan,nan
+2026-06-12T00:31:57Z,sglang-vanilla,prefill,n/a,full,cuda:0,8,512,2048,248320,nan,86.97900176048279,nan,nan,120.99716067314148,nan,47091.8258096282,0.0,0.0,nan,nan,nan
+2026-06-12T00:31:57Z,sglang-vanilla,prefill,n/a,full,cuda:0,8,2048,2048,248320,nan,212.4167736619711,nan,nan,217.6961861550808,nan,77131.38523642506,0.0,0.0,nan,nan,nan
+2026-06-12T00:31:57Z,sglang-vanilla,prefill,n/a,full,cuda:0,32,128,2048,248320,nan,121.64732627570629,nan,nan,127.14210525155067,nan,33671.105854942216,0.0,0.0,nan,nan,nan
+2026-06-12T00:31:57Z,sglang-vanilla,prefill,n/a,full,cuda:0,32,512,2048,248320,nan,218.87792274355888,nan,nan,268.97082477808,nan,74854.51156805693,0.0,0.0,nan,nan,nan
+2026-06-12T00:31:57Z,sglang-vanilla,prefill,n/a,full,cuda:0,32,2048,2048,248320,nan,820.847861468792,nan,nan,864.1412071883678,nan,79839.39908515145,0.0,0.0,nan,nan,nan
