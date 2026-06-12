@@ -447,12 +447,30 @@ def main() -> None:
         )
         tokenizer.save_pretrained(str(dst_dir))
 
-        # Copy config so SGLang / vLLM can load without transformers
-        for fname in ("config.json", "generation_config.json"):
+        # save_pretrained writes architectures=Qwen3_5MoeForCausalLM (HF class name).
+        # SGLang 0.5.x registers Qwen3_5MoeForConditionalGeneration — restore from src.
+        import json
+        import shutil
+
+        src_cfg_path = src_dir / "config.json"
+        dst_cfg_path = dst_dir / "config.json"
+        if src_cfg_path.exists() and dst_cfg_path.exists():
+            with src_cfg_path.open() as f:
+                src_cfg = json.load(f)
+            with dst_cfg_path.open() as f:
+                dst_cfg = json.load(f)
+            if "architectures" in src_cfg:
+                old = dst_cfg.get("architectures")
+                dst_cfg["architectures"] = src_cfg["architectures"]
+                print(f"  config architectures: {old} -> {dst_cfg['architectures']}")
+            with dst_cfg_path.open("w") as f:
+                json.dump(dst_cfg, f, indent=2)
+                f.write("\n")
+
+        for fname in ("generation_config.json",):
             src_f = src_dir / fname
             dst_f = dst_dir / fname
-            if src_f.exists() and not dst_f.exists():
-                import shutil
+            if src_f.exists():
                 shutil.copy2(src_f, dst_f)
 
         print(f"  Saved in {time.time() - t_save:.0f}s")

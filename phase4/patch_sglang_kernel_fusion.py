@@ -8,6 +8,7 @@ layers are ``Qwen3_5MoeDecoderLayer`` (Transformers backend).
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 from pathlib import Path
@@ -24,6 +25,29 @@ from patch_hf_kernel_fusion import patch_decoder_layer  # noqa: E402
 from qwen3_moe_layers import DECODER_CLS  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
+
+def sync_fused_config_architectures(vanilla_dir: str | Path, fused_dir: str | Path) -> bool:
+    """Copy ``architectures`` from vanilla config so SGLang recognizes the fused ckpt."""
+    vanilla_cfg = Path(vanilla_dir) / "config.json"
+    fused_cfg = Path(fused_dir) / "config.json"
+    if not vanilla_cfg.is_file() or not fused_cfg.is_file():
+        return False
+
+    src = json.loads(vanilla_cfg.read_text())
+    dst = json.loads(fused_cfg.read_text())
+    target = src.get("architectures")
+    if not target:
+        return False
+    if dst.get("architectures") == target:
+        return False
+
+    old = dst.get("architectures")
+    dst["architectures"] = target
+    fused_cfg.write_text(json.dumps(dst, indent=2) + "\n")
+    print(f"[config] {fused_cfg.name} architectures: {old} -> {target}")
+    return True
+
 
 _LAYER_LIST_PATHS = (
     "model.layers",

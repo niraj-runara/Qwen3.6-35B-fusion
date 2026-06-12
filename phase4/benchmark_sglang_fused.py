@@ -59,6 +59,7 @@ from benchmark_reference import (  # noqa: E402
 import benchmark_sglang as sg3  # noqa: E402
 
 DEFAULT_FUSED_DIR = os.environ.get("FUSED_DIR", "/data/Qwen3.6-35B-A3B-bf16-fused")
+DEFAULT_VANILLA_DIR = os.environ.get("MODEL_DIR", "/data/Qwen3.6-35B-A3B-bf16")
 DEFAULT_ORACLE = str(_REPO_ROOT / "phase1/outputs/reference_logits.pt")
 DEFAULT_BASELINE_GLOB = str(_REPO_ROOT / "phase3/results/benchmark_*_sglang-vanilla_prefill_na_full.csv")
 _RESULTS_DIR = Path(__file__).resolve().parent / "results"
@@ -167,6 +168,11 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--fused-dir", default=DEFAULT_FUSED_DIR)
     p.add_argument(
+        "--vanilla-dir",
+        default=DEFAULT_VANILLA_DIR,
+        help="Vanilla ckpt for config.json architectures sync (SGLang)",
+    )
+    p.add_argument(
         "--baseline-csv",
         default="",
         help="Phase 3 vanilla CSV (default: latest under phase3/results/)",
@@ -200,6 +206,10 @@ def main() -> None:
     if not os.path.isdir(args.fused_dir):
         print(f"ERROR: fused checkpoint not found: {args.fused_dir}")
         sys.exit(1)
+
+    from patch_sglang_kernel_fusion import sync_fused_config_architectures
+
+    sync_fused_config_architectures(args.vanilla_dir, args.fused_dir)
 
     baseline_path = Path(args.baseline_csv) if args.baseline_csv else _latest_baseline_csv(DEFAULT_BASELINE_GLOB)
     if baseline_path is None or not baseline_path.is_file():

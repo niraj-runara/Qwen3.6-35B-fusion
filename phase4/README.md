@@ -18,14 +18,16 @@ Weight-fused checkpoint + **Site-1 kernel fusion** (same fast-path as Phase 2 HF
 ## Prerequisites
 
 1. Phase 3 engine baseline CSV in `phase3/results/`
-2. Fused checkpoint: `/data/Qwen3.6-35B-A3B-bf16-fused` (`fused-checkpoint/export_fused_weights.py`)
+2. Fused checkpoint: `/data/Qwen3.6-35B-A3B-bf16-fused`
 3. Phase 1 + Phase 3 SGLang env (`phase3/setup_sglang.sh`)
-4. Fusion plugin:
+4. Fusion plugin (also fixes fused `config.json` for SGLang):
 
 ```bash
 source phase1/.venv/bin/activate
 bash phase4/setup_fusion_plugin.sh
 ```
+
+The benchmark also syncs `architectures` from vanilla → fused at startup if needed.
 
 ---
 
