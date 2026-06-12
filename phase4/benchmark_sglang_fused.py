@@ -296,10 +296,10 @@ def main() -> None:
                     "variant": args.variant if use_kernel else "weights-only",
                     "load_mode": "full",
                     "device": "cuda:0",
-                    "baseline_csv": str(baseline_path),
                 },
             )
             print(f"\n[saved] {path}")
+            print(f"[baseline] {baseline_path}")
 
     finally:
         if runner is not None:
