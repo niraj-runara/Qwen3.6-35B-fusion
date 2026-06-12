@@ -130,6 +130,28 @@ def _make_input_ids(tokenizer, batch: int, seq_len: int) -> list[list[int]]:
     return [row[:] for _ in range(batch)]
 
 
+def _extract_first_generated_token(item: dict) -> int | None:
+    """Return the first newly generated token id from an SGLang generate response."""
+    meta = item.get("meta_info") or {}
+    n_new = meta.get("completion_tokens", 1) if isinstance(meta, dict) else 1
+
+    ids = item.get("output_ids")
+    if ids is None and isinstance(meta, dict):
+        ids = meta.get("output_ids")
+    if ids is None:
+        return None
+
+    if ids and isinstance(ids[0], list):
+        ids = ids[0]
+    if not ids:
+        return None
+
+    # output_ids may include prompt prefix; completion_tokens is a count, not ids
+    if isinstance(n_new, int) and n_new > 0:
+        ids = ids[-n_new:]
+    return int(ids[0])
+
+
 def _sync_ms(fn) -> float:
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -348,17 +370,13 @@ def check_logits_engine(runner: SGLangEngineRunner, oracle_path: Path) -> bool:
     oracle_top1 = int(oracle.argmax().item())
 
     out = runner.prefill_reference()
-    # SGLang returns a list of dicts
     item = out[0] if isinstance(out, list) else out
-    meta = item.get("meta_info", item)
-    output_ids = meta.get("output_ids") or meta.get("completion_tokens") or []
-    if not output_ids:
-        text = item.get("text", "")
-        print(f"[check-logits] Generated: {text!r}")
+    gen_top1 = _extract_first_generated_token(item)
+    if gen_top1 is None:
+        print(f"[check-logits] Generated: {item.get('text', '')!r}")
+        print(f"[check-logits] Response keys: {list(item.keys())}")
         print("[check-logits] Could not read output token id — verify manually.")
         return False
-
-    gen_top1 = int(output_ids[0]) if isinstance(output_ids[0], int) else int(output_ids[0][0])
     match = gen_top1 == oracle_top1
     print(f"\n[check-logits] oracle top-1 = {oracle_top1}  |  sglang top-1 = {gen_top1}  |  match = {match}")
     return match
@@ -375,14 +393,11 @@ def check_logits_http(runner: SGLangHttpRunner, model_dir: str, oracle_path: Pat
     item = _http_prefill_reference(runner, model_dir)
     if isinstance(item, list):
         item = item[0]
-    meta = item.get("meta_info", item)
-    output_ids = meta.get("output_ids") or []
-    if not output_ids:
+    gen_top1 = _extract_first_generated_token(item)
+    if gen_top1 is None:
         print(f"[check-logits] Response keys: {list(item.keys())}")
         print("[check-logits] Could not read output token id — verify manually.")
         return False
-
-    gen_top1 = int(output_ids[0])
     match = gen_top1 == oracle_top1
     print(f"\n[check-logits] oracle top-1 = {oracle_top1}  |  sglang top-1 = {gen_top1}  |  match = {match}")
     return match
