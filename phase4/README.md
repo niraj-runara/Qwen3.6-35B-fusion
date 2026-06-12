@@ -99,3 +99,5 @@ Compare `speedup` column to Phase 2 HF E2E — expect larger gains here if SGLan
 | `patch_sglang_kernel_fusion.py` | Resolve `model.layers`, apply Phase 2 Site-1 patch |
 | `benchmark_sglang_fused.py` | 9-shape prefill sweep + speedup vs Phase 3 |
 | `launch_server_fused.sh` | Fused model HTTP server |
+
+**Native SGLang layer fusion** (experimental) lives in **`phase5/`** — separate plugin `qwen_fusion_native`, does not modify Phase 4.

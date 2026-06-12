@@ -43,5 +43,6 @@ env/
 *.safetensors
 profiler_trace/
 
-# Editable plugin install (phase4)
+# Editable plugin installs (phase4 / phase5)
 qwen_sglang_fusion.egg-info/
+qwen_sglang_fusion_native.egg-info/

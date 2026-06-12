@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=70.0.0,<82.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen-sglang-fusion-native"
+version = "0.1.0"
+description = "Qwen3.6 native SGLang layer fusion plugin (Phase 5)"
+requires-python = ">=3.11"
+
+[project.entry-points."sglang.srt.plugins"]
+qwen_fusion_native = "sglang_fusion_native_plugin:activate"
+
+[tool.setuptools]
+py-modules = [
+    "sglang_fusion_native_plugin",
+    "patch_sglang_kernel_fusion",
+    "patch_sglang_native_fusion",
+]
