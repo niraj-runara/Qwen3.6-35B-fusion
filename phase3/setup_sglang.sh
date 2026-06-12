@@ -9,7 +9,6 @@
 # Usage (from repo root):
 #   source phase1/.venv/bin/activate
 #   bash phase3/setup_sglang.sh
-#   source phase3/env_sglang.sh
 
 set -euo pipefail
 
@@ -116,14 +115,9 @@ from sglang import Engine
 print('Engine import OK')
 "
 
-ENV_FILE="$SCRIPT_DIR/env_sglang.sh"
-cat > "$ENV_FILE" <<EOF
-# Source before Phase 3: source phase3/env_sglang.sh
-export LD_LIBRARY_PATH="${CUDA_LD}\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
-export TRITON_PTXAS_PATH="\${TRITON_PTXAS_PATH:-/usr/local/cuda/bin/ptxas}"
-EOF
-
 echo ""
 echo "=== Done ==="
-echo "  source phase3/env_sglang.sh"
 echo "  python phase3/benchmark_sglang.py --model-dir /data/Qwen3.6-35B-A3B-bf16 --check-logits"
+echo ""
+echo "For a new shell (e.g. launch_server), export LD_LIBRARY_PATH once:"
+echo "  export LD_LIBRARY_PATH=\"${CUDA_LD}\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}\""

@@ -35,8 +35,21 @@ import argparse
 import gc
 import json
 import os
+import site
 import sys
 import time
+
+# libnvrtc.so.13 — pip nvidia-* wheels; must be set before import sgl_kernel
+_sp = site.getsitepackages()[0]
+_cuda_ld = ":".join(
+    os.path.join(_sp, "nvidia", sub, "lib")
+    for sub in ("cuda_nvrtc", "cuda_runtime", "cu13")
+    if os.path.isdir(os.path.join(_sp, "nvidia", sub, "lib"))
+)
+if _cuda_ld:
+    _old = os.environ.get("LD_LIBRARY_PATH", "")
+    if "cuda_nvrtc" not in _old:
+        os.environ["LD_LIBRARY_PATH"] = f"{_cuda_ld}:{_old}" if _old else _cuda_ld
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any

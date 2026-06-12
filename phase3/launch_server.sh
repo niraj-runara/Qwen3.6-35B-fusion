@@ -9,8 +9,8 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-[[ -f "$SCRIPT_DIR/env_sglang.sh" ]] && source "$SCRIPT_DIR/env_sglang.sh"
+VENV_SITE=$(python -c "import site; print(site.getsitepackages()[0])")
+export LD_LIBRARY_PATH="${VENV_SITE}/nvidia/cuda_nvrtc/lib:${VENV_SITE}/nvidia/cuda_runtime/lib:${VENV_SITE}/nvidia/cu13/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 MODEL_DIR="${MODEL_DIR:-/data/Qwen3.6-35B-A3B-bf16}"
 PORT="${PORT:-30000}"
