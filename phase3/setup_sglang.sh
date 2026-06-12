@@ -28,17 +28,21 @@ KERNEL_VERSION="${KERNEL_VERSION:-0.4.3}"
 echo "=== Phase 3 SGLang setup (Blackwell / cu130) ==="
 echo "Python: $($PYTHON --version 2>&1)"
 
-# CUDA runtime libs (libnvrtc.so.13) for kernel .so loading
-for d in \
-  /usr/local/cuda/lib64 \
-  /usr/local/cuda-13.0/targets/x86_64-linux/lib \
-  /usr/local/cuda-13.0/targets/sbsa-linux/lib \
-  /usr/local/cuda/targets/x86_64-linux/lib; do
-  if [[ -f "$d/libnvrtc.so.13" || -L "$d/libnvrtc.so" ]]; then
-    export CUDA_LIB_DIR="$d"
-    break
-  fi
-done
+VENV_SITE=$("$PYTHON" -c "import site; print(site.getsitepackages()[0])")
+
+# libnvrtc.so.13 — usually in pip nvidia-* wheels, not system CUDA
+_cuda_ld_path() {
+  local parts=()
+  for d in \
+    "${VENV_SITE}/nvidia/cuda_nvrtc/lib" \
+    "${VENV_SITE}/nvidia/cuda_runtime/lib" \
+    "${VENV_SITE}/nvidia/cu13/lib" \
+    "${VENV_SITE}/torch/lib" \
+    /usr/local/cuda/lib64; do
+    [[ -d "$d" ]] && parts+=("$d")
+  done
+  (IFS=:; echo "${parts[*]}")
+}
 
 echo ""
 echo "=== Step 1/4: PyTorch ${TORCH_VERSION} (cu130) ==="
@@ -87,11 +91,11 @@ if ! "$PIP" install --force-reinstall --no-cache-dir "$WHEEL_URL"; then
 fi
 
 echo ""
-echo "=== Step 4/4: Verify import ==="
-if [[ -n "${CUDA_LIB_DIR:-}" ]]; then
-  export LD_LIBRARY_PATH="${CUDA_LIB_DIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-  echo "LD_LIBRARY_PATH includes: $CUDA_LIB_DIR"
-fi
+echo "=== Step 4/4: CUDA runtime libs + verify ==="
+"$PIP" install --upgrade nvidia-cuda-nvrtc nvidia-cuda-runtime
+CUDA_LD=$(_cuda_ld_path)
+export LD_LIBRARY_PATH="${CUDA_LD}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+echo "LD_LIBRARY_PATH=${CUDA_LD}"
 
 "$PYTHON" -c "
 import torch
@@ -113,13 +117,11 @@ print('Engine import OK')
 "
 
 ENV_FILE="$SCRIPT_DIR/env_sglang.sh"
-{
-  echo "# Source before Phase 3 benchmarks: source phase3/env_sglang.sh"
-  if [[ -n "${CUDA_LIB_DIR:-}" ]]; then
-    echo "export LD_LIBRARY_PATH=\"${CUDA_LIB_DIR}\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}\""
-  fi
-  echo "export TRITON_PTXAS_PATH=\"\${TRITON_PTXAS_PATH:-/usr/local/cuda/bin/ptxas}\""
-} > "$ENV_FILE"
+cat > "$ENV_FILE" <<EOF
+# Source before Phase 3: source phase3/env_sglang.sh
+export LD_LIBRARY_PATH="${CUDA_LD}\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+export TRITON_PTXAS_PATH="\${TRITON_PTXAS_PATH:-/usr/local/cuda/bin/ptxas}"
+EOF
 
 echo ""
 echo "=== Done ==="

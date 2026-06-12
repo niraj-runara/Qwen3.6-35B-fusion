@@ -140,9 +140,11 @@ Or re-run `bash phase3/setup_sglang.sh` (does the above in order).
 
 ### Missing `libnvrtc.so.13`
 
+No system CUDA toolkit on the host — install pip wheels and set `LD_LIBRARY_PATH`:
+
 ```bash
-export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
-# or: source phase3/env_sglang.sh
+pip install nvidia-cuda-nvrtc nvidia-cuda-runtime
+source phase3/env_sglang.sh   # written by setup_sglang.sh
 ```
 
 ---
