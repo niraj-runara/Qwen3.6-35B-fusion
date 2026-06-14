@@ -343,40 +343,112 @@ Also benchmark Phase 2 (HF+fusion) vs Phase 4 (SGLang+fusion) to confirm SGLang'
 
 **Deliverables:** `sglang_fusion_plugin/`, fused SGLang server running, final benchmark table comparing all 4 phases.
 
+**Status (2026-06):** Implemented as `phase4/` with plugin `qwen_fusion` (HF `patch_hf_kernel_fusion` on `post_load_weights`). Correctness passes; **no E2E speedup** — HF forward replacement regresses ~15–20% at small batch vs Phase 3. Fused weights only (`--no-kernel`) ≈ parity (~0.98–1.00×). Fused ckpt needs vanilla metadata sync (`config.json`, `preprocessor_config.json`, etc.) for SGLang multimodal load.
+
+---
+
+## Phase 5 — Native SGLang Layer Fusion (Experimental)
+
+**Goal:** Apply Site-1 fusion **inside SGLang’s own layer graph** (`Qwen3_5LinearDecoderLayer` / `Qwen3_5AttentionDecoderLayer`) instead of replacing forwards with the HF `Qwen3_5MoeDecoderLayer` patch from Phase 4. Keep Phase 4 frozen as the HF-plugin baseline; iterate in `phase5/`.
+
+**Motivation:** Phase 4 proved that swapping in HF decoder `forward` bypasses SGLang’s optimized norm/GEMM/attention/MoE stack. Phase 5 tests whether hooking the **native** path — skip `input_layernorm`, fuse projections only — recovers parity or yields a small gain.
+
+### 5.1 Approach (vs Phase 4)
+
+| | Phase 4 | Phase 5 |
+|---|---------|---------|
+| Target layers | HF `Qwen3_5MoeDecoderLayer` (if present) | Native `Qwen3_5*DecoderLayer` |
+| Plugin entry | `qwen_fusion` | `qwen_fusion_native` |
+| Patch scope | Whole decoder `forward` (Phase 2) | `LayerCommunicator.prepare_attn` + input projections |
+| MoE (Site 2) | HF `--site2` only (not on native path) | Stock `post_attention_layernorm` + `FusedMoE` |
+
+**Site-1 native hooks (per layer, after weight load):**
+
+1. **`prepare_attn`** — skip `input_layernorm`; keep residual bookkeeping; compute shared `rms(x)` via Phase 2 `Site1RmsState`.
+2. **Linear-attn layers** — patch `Qwen3_5GatedDeltaNet._forward_input_proj`: `in_proj_qkvz`, `in_proj_ba` as `linear(x) / rms(x)`.
+3. **Full-attn layers** — patch `self_attention`: `qkv_proj` as `linear(x) / rms(x)`.
+4. **Fallback** — stock `prepare_attn` on TP scatter, quant, or allreduce-fusion paths.
+
+Weight-fused checkpoint and Phase 3 baseline CSV comparison unchanged from Phase 4.
+
+### 5.2 Implementation layout
+
+```
+phase5/
+  patch_sglang_native_fusion.py   # Native layer Site-1 hooks
+  patch_sglang_kernel_fusion.py   # Layer resolution; native-first, HF fallback
+  sglang_fusion_native_plugin.py  # post_load_weights → qwen_fusion_native
+  benchmark_sglang_fused.py       # CSV benchmark_mode: sglang-fused-native
+  setup_fusion_plugin.sh
+  launch_server_fused.sh
+```
+
+Install and run:
+
+```bash
+bash phase5/setup_fusion_plugin.sh
+export SGLANG_PLUGINS=qwen_fusion_native
+export SGLANG_FUSION=1
+
+python phase5/benchmark_sglang_fused.py \
+    --fused-dir /data/Qwen3.6-35B-A3B-bf16-fused \
+    --baseline-csv phase3/results/benchmark_*_sglang-vanilla_prefill_na_full.csv \
+    --check-logits
+```
+
+Scheduler logs should show `native=N` (e.g. 40 layers) in the fusion plugin line.
+
+### 5.3 Correctness
+
+Same gates as Phase 4:
+
+- Fused checkpoint loads in SGLang (metadata synced from vanilla).
+- `--check-logits` vs Phase 1 oracle (top-1 token match).
+- No regression vs Phase 4 weights-only path on numerics.
+
+### 5.4 Expected outcome (hypothesis)
+
+Native hooks avoid HF forward overhead → at least match Phase 4 `--no-kernel` (~1.0×), possibly small Site-1 gain from skipping `input_layernorm` kernel launches.
+
+### 5.5 Actual results (2026-06, Blackwell)
+
+| Regime | Speedup vs Phase 3 vanilla |
+|--------|---------------------------|
+| Small batch (1×128–512) | **~0.97×** |
+| Mid / large (8×2048, 32×*) | **~1.00×** |
+
+**Conclusion:** Native Python Site-1 fixes the Phase 4 regression but **does not beat** stock SGLang. SGLang already runs fast separate norm + GEMM kernels; skipping norm and doing `matmul` + `/ rms` in Python is parity or slightly worse. Site-2 on native MoE was **not implemented** and is not expected to help (Phase 2 E2E: stock MoE + fused weights is faster than Site-2 runtime wrappers).
+
+### 5.6 Future work (out of scope for Phase 5 plugins)
+
+Meaningful SGLang speedup would require a **custom fused CUDA/Triton op** (`(x @ W) / rms(x)`) wired into `sglang/srt/models/qwen3_5.py` (fork or upstream PR), not external plugins. Realistic E2E gain even then: **~1–5%** — norm+linear is a thin slice vs attention + FusedMoE.
+
+**Deliverables:** `phase5/` plugin + benchmark CSVs under `phase5/results/`; comparison table vs Phase 3, Phase 4 (HF plugin), Phase 4 weights-only.
+
 ---
 
 ## Summary Table
 
-| Phase | Backend | Fusion | Checkpoint | Goal |
-|---|---|---|---|---|
-| 1 | HF transformers | None | Vanilla BF16 | Baseline + correctness oracle |
-| 2 | HF transformers | Weight + Kernel | BF16-fused | Prove fusion is correct + fast |
-| 3 | SGLang | None | Vanilla BF16 | SGLang baseline, understand engine internals |
-| 4 | SGLang | Weight + Kernel | BF16-fused | Production-ready fused serving |
+| Phase | Backend | Fusion | Checkpoint | CSV mode | Goal |
+|---|---|---|---|---|---|
+| 1 | HF transformers | None | Vanilla BF16 | — | Baseline + correctness oracle |
+| 2 | HF transformers | Weight + Kernel | BF16-fused | `hf-e2e` | Prove fusion correct + modest E2E gain (~1.0–1.06×) |
+| 3 | SGLang | None | Vanilla BF16 | `sglang-vanilla` | SGLang baseline (~3–7× faster than HF E2E) |
+| 4 | SGLang | Weight + HF kernel plugin | BF16-fused | `sglang-fused` | Fused serving via `qwen_fusion` — **no speedup; HF patch slower** |
+| 5 | SGLang | Weight + **native** layer hooks | BF16-fused | `sglang-fused-native` | Native Site-1 in SGLang graph — **parity only (~1.0×)** |
+
+### Recommendations (post Phase 5)
+
+| Use case | Use |
+|----------|-----|
+| HF eager inference | Fused ckpt + Phase 2 Site-1 V2 |
+| SGLang production | Vanilla ckpt, or fused ckpt **without** kernel plugin |
+| Phase 4 / 5 plugins | Research only — not for production inference |
+| Further SGLang gains | Upstream/fork fused norm+GEMM kernel in SGLang itself |
+
+See [README.md](README.md) for full results and learnings across all phases.
 
 ---
 
-## Key Differences from Kimi-K2.6 Work (What Is New)
 
-| Aspect | Kimi-K2.6 (this repo) | Qwen3.6-35B-A3B (this plan) |
-|---|---|---|
-| Attention | MLA with latent KV (q_a, kv_a, kv_b) | Standard GQA (q, k, v) |
-| Fusion site 1 | `input_layernorm` + `fused_qkv_a_proj` | `input_layernorm` + `q_proj`, `k_proj`, `v_proj` |
-| Fusion site 2 | `q_a_layernorm` + `q_b_proj` | `post_attention_layernorm` + per-expert `gate_proj`/`up_proj` |
-| Fusion site 3 | `kv_a_layernorm` + kv_b (weight-only) | N/A |
-| MoE expert fusion | Not present | New — shared rms for gate+up |
-| Inference engine | vLLM (native MLA + TRITON_MLA) | SGLang |
-| Quantization | NVFP4A16 | BF16 first, NVFP4 later if needed |
-| Plugin mechanism | `VLLM_PLUGINS` / `general_plugins` | SGLang equivalent (TBD in Phase 3) |
 
----
-
-## Risk Register
-
-| Risk | Likelihood | Mitigation |
-|---|---|---|
-| SGLang module names differ from HF (weight key mismatch) | Medium | Check `model.state_dict().keys()` before writing any patch script |
-| SGLang uses `torch.compile` and patched forwards are traced | Medium | Run with `--disable-cuda-graph` initially; add compile-compatible versions later |
-| MoE expert dispatch (token routing) runs before expert forward, breaking simple patching | Low | The fusion only modifies the per-expert `forward`; dispatch is upstream |
-| Rms computed twice per expert (gate + up) hurts throughput | Low | Phase 4.3 shared-rms extension eliminates this |
-| Logit drift > atol after weight fusion | Low | Apply gamma multiplication in FP32 before saving; compare with `torch.allclose(atol=1e-2)` |
