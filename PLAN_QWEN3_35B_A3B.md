@@ -421,7 +421,7 @@ Native hooks avoid HF forward overhead → at least match Phase 4 `--no-kernel` 
 
 ### 5.6 Future work (out of scope for Phase 5 plugins)
 
-Meaningful SGLang speedup would require a **custom fused CUDA/Triton op** (`(x @ W) / rms(x)`) wired into `sglang/srt/models/qwen3_5.py` (fork or upstream PR), not external plugins. Realistic E2E gain even then: **~1–5%** — norm+linear is a thin slice vs attention + FusedMoE.
+Meaningful SGLang speedup would require a **custom fused CUDA/Triton op** (`(x @ W) / rms(x)`) wired into a **local SGLang clone** (`sglang/srt/models/qwen3_5.py`), not external plugins. Realistic E2E gain even then: **~1–5%**.
 
 **Deliverables:** `phase5/` plugin + benchmark CSVs under `phase5/results/`; comparison table vs Phase 3, Phase 4 (HF plugin), Phase 4 weights-only.
 
@@ -444,9 +444,17 @@ Meaningful SGLang speedup would require a **custom fused CUDA/Triton op** (`(x @
 | HF eager inference | Fused ckpt + Phase 2 Site-1 V2 |
 | SGLang production | Vanilla ckpt, or fused ckpt **without** kernel plugin |
 | Phase 4 / 5 plugins | Research only — not for production inference |
-| Further SGLang gains | Upstream/fork fused norm+GEMM kernel in SGLang itself |
+| Further SGLang gains | Local clone + fused norm+GEMM kernel in `qwen3_5.py` |
 
 See [README.md](README.md) for full results and learnings across all phases.
+
+---
+
+## Phase 6 — Fused kernel inside SGLang (planned)
+
+Implementation plan for a real fused norm+GEMM op in a **local SGLang clone** (`qwen3_5.py` / Triton). No upstream PR required. Plugins (Phases 4–5) are insufficient.
+
+**Details:** [phase6/README.md](phase6/README.md)
 
 ---
 
