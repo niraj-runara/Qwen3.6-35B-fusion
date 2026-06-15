@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+"""
+Phase 6 — SGLang in-engine Site-1 fused kernel prefill benchmark.
+
+Fused checkpoint + ``--enable-qwen-fusion`` kernel in the local SGLang clone.
+Compares fused arm vs Phase 3 vanilla CSV (nonfused columns).
+
+Prerequisites:
+  source phase6/env.sh
+  bash phase6/sync_fused_ckpt_metadata.sh   # once
+
+Engine backend (default — same as Phase 4/5; stop any server on :30000 first):
+  source phase6/env.sh
+  python phase6/benchmark_sglang_fused_kernel.py --check-logits
+
+HTTP backend (optional — against a running server):
+  bash phase6/launch_server.sh
+  python phase6/benchmark_sglang_fused_kernel.py --backend http --check-logits
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import gc
+import os
+import site
+import sys
+import time
+from datetime import datetime, timezone
+from glob import glob
+from pathlib import Path
+
+# libnvrtc.so.13 — same as phase3
+_sp = site.getsitepackages()[0]
+_cuda_ld = ":".join(
+    os.path.join(_sp, "nvidia", sub, "lib")
+    for sub in ("cuda_nvrtc", "cuda_runtime", "cu13")
+    if os.path.isdir(os.path.join(_sp, "nvidia", sub, "lib"))
+)
+if _cuda_ld:
+    _old = os.environ.get("LD_LIBRARY_PATH", "")
+    if "cuda_nvrtc" not in _old:
+        os.environ["LD_LIBRARY_PATH"] = f"{_cuda_ld}:{_old}" if _old else _cuda_ld
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_PHASE3 = _REPO_ROOT / "phase3"
+_PHASE5 = _REPO_ROOT / "phase5"
+_PHASE6 = _REPO_ROOT / "phase6"
+for _p in (_REPO_ROOT, _PHASE3, _PHASE5):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+import torch  # noqa: E402
+
+from benchmark_reference import (  # noqa: E402
+    MEASURE_ITERS,
+    WARMUP_ITERS,
+    ShapeResult,
+    print_summary_table,
+    save_csv,
+)
+import benchmark_sglang as sg3  # noqa: E402
+
+DEFAULT_FUSED_DIR = os.environ.get("FUSED_DIR", "/data/Qwen3.6-35B-A3B-bf16-fused")
+DEFAULT_VANILLA_DIR = os.environ.get("MODEL_DIR", "/data/Qwen3.6-35B-A3B-bf16")
+DEFAULT_ORACLE = str(_REPO_ROOT / "phase1/outputs/reference_logits.pt")
+DEFAULT_BASELINE_GLOB = str(
+    _REPO_ROOT / "phase3/results/benchmark_*_sglang-vanilla_prefill_na_full.csv"
+)
+_RESULTS_DIR = _PHASE6 / "results"
+_BENCHMARK_MODE = "sglang-fused-kernel"
+
+
+def _latest_baseline_csv(pattern: str) -> Path | None:
+    matches = sorted(glob(pattern), key=os.path.getmtime)
+    return Path(matches[-1]) if matches else None
+
+
+def _load_baseline_rows(csv_path: Path) -> dict[tuple[int, int], dict[str, float]]:
+    """Map (batch, seq_len) -> nonfused metrics from Phase 3 CSV."""
+    out: dict[tuple[int, int], dict[str, float]] = {}
+    with csv_path.open(newline="") as f:
+        for row in csv.DictReader(f):
+            key = (int(row["batch"]), int(row["seq_len"]))
+            out[key] = {
+                "nonfused_median_ms": float(row["nonfused_median_ms"]),
+                "nonfused_p99_ms": float(row["nonfused_p99_ms"]),
+                "nonfused_throughput": float(row["nonfused_throughput"]),
+                "nonfused_peak_mem_mb": float(row.get("nonfused_peak_mem_mb") or "nan"),
+            }
+    return out
+
+
+def _synthetic_latencies(median: float, p99: float, n: int = 200) -> list[float]:
+    k = max(1, n // 100)
+    return [median] * (n - k) + [p99] * k
+
+
+def _merge_baseline(results: list[ShapeResult], baseline: dict[tuple[int, int], dict]) -> None:
+    for r in results:
+        row = baseline.get((r.batch, r.seq_len))
+        if not row:
+            print(f"  [warn] no Phase 3 baseline for batch={r.batch} seq={r.seq_len}")
+            continue
+        r.nonfused_latencies = _synthetic_latencies(
+            row["nonfused_median_ms"], row["nonfused_p99_ms"]
+        )
+        r.nonfused_peak_mem_mb = row["nonfused_peak_mem_mb"]
+
+
+class SGLangFusedEngineRunner:
+    """In-process Engine with Phase 6 ``enable_qwen_fusion``."""
+
+    def __init__(
+        self,
+        model_dir: str,
+        *,
+        mem_fraction: float = 0.90,
+        context_length: int = sg3.DEFAULT_CONTEXT_LENGTH,
+        enable_fusion: bool = True,
+    ):
+        from sglang import Engine
+
+        self.model_dir = model_dir
+        print(f"\n[engine] Loading SGLang Engine from {model_dir} ...")
+        print(f"[engine] context_length={context_length}")
+        print(f"[engine] enable_qwen_fusion={enable_fusion}")
+        t0 = time.time()
+        self.engine = Engine(
+            model_path=model_dir,
+            tp_size=1,
+            dtype="bfloat16",
+            trust_remote_code=True,
+            mem_fraction_static=mem_fraction,
+            context_length=context_length,
+            log_level="error",
+            enable_qwen_fusion=enable_fusion,
+        )
+        print(f"[engine] Ready in {time.time() - t0:.0f}s")
+
+    def prefill(self, input_ids: list[list[int]]) -> None:
+        self.engine.generate(
+            input_ids=input_ids,
+            sampling_params=sg3._SAMPLING_PREFILL,
+        )
+
+    def prefill_reference(self):
+        tok = sg3._load_tokenizer(self.model_dir)
+        ids = tok(sg3.REFERENCE_PROMPT, return_tensors="pt")["input_ids"][0].tolist()
+        return self.engine.generate(
+            input_ids=[ids],
+            sampling_params=sg3._SAMPLING_PREFILL,
+        )
+
+    def shutdown(self) -> None:
+        if hasattr(self.engine, "shutdown"):
+            self.engine.shutdown()
+
+
+def run_fused_prefill_benchmark(
+    runner,
+    *,
+    hidden: int,
+    out_dim: int,
+    warmup: int,
+    measure: int,
+    tokenizer,
+    model_dir: str,
+) -> list[ShapeResult]:
+    results: list[ShapeResult] = []
+
+    for batch, seq_len in sg3._BATCH_SEQ_PAIRS:
+        print(f"\n{'=' * 62}")
+        print(f"[prefill]  batch={batch}  seq_len={seq_len}  hidden={hidden}")
+        print(f"{'=' * 62}")
+
+        input_ids = sg3._make_input_ids(tokenizer, batch, seq_len)
+        result = ShapeResult(batch=batch, seq_len=seq_len, hidden=hidden, out_dim=out_dim)
+
+        print("  Measuring prefill latency (Phase 6 fused kernel) ...")
+        result.fused_latencies = sg3._measure_prefill_latency(
+            runner, input_ids, warmup=warmup, measure=measure
+        )
+
+        if isinstance(runner, SGLangFusedEngineRunner):
+            print("  Measuring peak GPU memory ...")
+            try:
+                result.fused_peak_mem_mb = sg3._measure_peak_memory_mb(runner, input_ids)
+            except Exception as exc:
+                print(f"  [warn] peak memory measurement failed: {exc}")
+                result.fused_peak_mem_mb = float("nan")
+        else:
+            result.fused_peak_mem_mb = float("nan")
+
+        result.max_abs_diff = float("nan")
+        result.cosine_sim = float("nan")
+        result.kl_divergence = float("nan")
+
+        med = result.fused_median_ms
+        p99 = sg3._percentile(result.fused_latencies, 99)
+        tput = result.fused_throughput
+        print(f"\n  Latency (median ms):  {med:.4f}")
+        print(f"  Latency (p99 ms):     {p99:.4f}")
+        print(f"  Throughput (tok/s): {tput:,.0f}")
+        if result.fused_peak_mem_mb == result.fused_peak_mem_mb:
+            print(f"  Peak mem (MB):        {result.fused_peak_mem_mb:.1f}")
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        results.append(result)
+
+    return results
+
+
+def _configure_fusion_env(*, enable_fusion: bool) -> None:
+    os.environ["SGLANG_QWEN_FUSION"] = "1" if enable_fusion else "0"
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Phase 6: SGLang in-engine fused kernel prefill benchmark",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--fused-dir", default=DEFAULT_FUSED_DIR)
+    p.add_argument(
+        "--vanilla-dir",
+        default=DEFAULT_VANILLA_DIR,
+        help="Vanilla ckpt for config/metadata sync",
+    )
+    p.add_argument(
+        "--baseline-csv",
+        default="",
+        help="Phase 3 vanilla CSV (default: latest under phase3/results/)",
+    )
+    p.add_argument(
+        "--backend",
+        choices=("engine", "http"),
+        default="engine",
+        help="engine = in-process (default, like Phase 4/5); http = running server",
+    )
+    p.add_argument("--server-url", default="http://127.0.0.1:30000")
+    p.add_argument("--mem-fraction", type=float, default=0.90)
+    p.add_argument("--context-length", type=int, default=sg3.DEFAULT_CONTEXT_LENGTH)
+    p.add_argument(
+        "--no-fusion",
+        action="store_true",
+        help="Load fused ckpt but disable Site-1 kernel (weights-only control)",
+    )
+    p.add_argument("--warmup", type=int, default=WARMUP_ITERS)
+    p.add_argument("--measure", type=int, default=MEASURE_ITERS)
+    p.add_argument("--check-logits", action="store_true")
+    p.add_argument("--oracle", default=DEFAULT_ORACLE)
+    p.add_argument("--no-save", action="store_true")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    if not os.path.isdir(args.fused_dir):
+        print(f"ERROR: fused checkpoint not found: {args.fused_dir}")
+        sys.exit(1)
+
+    from patch_sglang_kernel_fusion import sync_fused_config_architectures
+
+    sync_fused_config_architectures(args.vanilla_dir, args.fused_dir)
+
+    baseline_path = (
+        Path(args.baseline_csv) if args.baseline_csv else _latest_baseline_csv(DEFAULT_BASELINE_GLOB)
+    )
+    if baseline_path is None or not baseline_path.is_file():
+        print(
+            "ERROR: Phase 3 baseline CSV not found. "
+            "Run phase3 benchmark first or pass --baseline-csv."
+        )
+        sys.exit(1)
+
+    use_fusion = not args.no_fusion
+    _configure_fusion_env(enable_fusion=use_fusion)
+
+    text_cfg = sg3._load_text_config(args.fused_dir)
+    hidden = int(getattr(text_cfg, "hidden_size", 2048))
+    out_dim = int(getattr(text_cfg, "vocab_size", 0)) or 0
+
+    kernel_desc = (
+        "Site-1 in-engine kernel (--enable-qwen-fusion)"
+        if use_fusion
+        else "disabled (fused weights only)"
+    )
+
+    print("=" * 62)
+    print("Phase 6 — SGLang fused kernel prefill benchmark")
+    print("=" * 62)
+    print(f"  Fused ckpt : {args.fused_dir}")
+    print(f"  Baseline   : {baseline_path}")
+    print(f"  Backend    : {args.backend}")
+    print(f"  Kernel     : {kernel_desc}")
+    print(f"  SGLANG_QWEN_FUSION : {os.environ.get('SGLANG_QWEN_FUSION')}")
+    print(f"  Context    : {args.context_length}")
+    print(f"  Warmup     : {args.warmup}  |  Measure: {args.measure}")
+    if args.backend == "engine":
+        print("  NOTE: stop any SGLang server on :30000 first (~70 GB GPU needed)")
+    elif use_fusion:
+        print(
+            "  NOTE: server must be started with --enable-qwen-fusion "
+            "(see phase6/launch_server.sh)"
+        )
+
+    baseline = _load_baseline_rows(baseline_path)
+    runner = None
+    tokenizer = sg3._load_tokenizer(args.fused_dir)
+
+    try:
+        if args.backend == "engine":
+            runner = SGLangFusedEngineRunner(
+                args.fused_dir,
+                mem_fraction=args.mem_fraction,
+                context_length=args.context_length,
+                enable_fusion=use_fusion,
+            )
+        else:
+            runner = sg3.SGLangHttpRunner(args.server_url)
+
+        if args.check_logits:
+            if args.backend == "engine":
+                ok = sg3.check_logits_engine(runner, Path(args.oracle))
+            else:
+                ok = sg3.check_logits_http(runner, args.fused_dir, Path(args.oracle))
+            if not ok:
+                print("[check-logits] FAIL")
+                sys.exit(1)
+            print("[check-logits] PASS")
+
+        results = run_fused_prefill_benchmark(
+            runner,
+            hidden=hidden,
+            out_dim=out_dim,
+            warmup=args.warmup,
+            measure=args.measure,
+            tokenizer=tokenizer,
+            model_dir=args.fused_dir,
+        )
+        _merge_baseline(results, baseline)
+
+        print(f"\n{'─' * 62}")
+        print("Summary — fused kernel vs Phase 3 vanilla (speedup = nf_med / fused_med)")
+        print_summary_table(results)
+
+        if not args.no_save:
+            _RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            run_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            tag = "kernel" if use_fusion else "weights-only"
+            path = str(
+                _RESULTS_DIR / f"benchmark_{ts}_{_BENCHMARK_MODE}_prefill_{tag}_full.csv"
+            )
+            save_csv(
+                results,
+                path,
+                run_metadata={
+                    "run_timestamp_utc": run_ts,
+                    "benchmark_mode": _BENCHMARK_MODE,
+                    "fusion_point": "prefill",
+                    "variant": tag,
+                    "load_mode": "full",
+                    "device": "cuda:0",
+                },
+            )
+            print(f"\n[saved] {path}")
+            print(f"[baseline] {baseline_path}")
+
+    finally:
+        if runner is not None:
+            runner.shutdown()
+
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()

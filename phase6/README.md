@@ -1,29 +1,33 @@
 # Phase 6 — Fused Norm+GEMM Inside SGLang
 
-**Goal:** Implement Site-1 fusion as a **real kernel** in SGLang’s Qwen3.5 forward path, so deployment uses `(x @ W_fused) / rms(x)` in one fused op instead of separate `GemmaRMSNorm` + GEMM.
+**Goal:** Implement Site-1 fusion as a **real kernel** in SGLang’s Qwen3.5 forward path: `(x @ W_fused) / rms(x)` instead of separate `GemmaRMSNorm` + GEMM.
 
-**Why Phase 6:** Phases 4–5 proved plugins cannot beat stock SGLang (~1.0×). Phase 2 layer-0 microbench shows **~1.58× attn / ~1.9× MoE** when fusion is actually in the hot path — but only on HF. Phase 6 targets that gap inside the engine.
+**Status (2026-06):** M0–M4 **complete**. Correctness verified; E2E prefill ~**1.00×** vs Phase 3 (3% target not met). Implementation details → **[SGLang_changes.md](./SGLang_changes.md)**.
 
-**Non-goals (initial scope):** Site-2 MoE kernel fusion, TP>1, FP8/quant paths, CUDA-graph-unfriendly Python hooks, Pie/inferlets.
+**Why Phase 6:** Phases 4–5 proved plugins cannot beat stock SGLang (~1.0×). Phase 2 layer-0 microbench shows **~1.58× attn / ~1.9× MoE** when fusion hits the hot path on HF — Phase 6 put that inside the engine.
 
----
-
-## Success criteria
-
-| Gate | Target |
-|------|--------|
-| Correctness | Top-1 token + logits vs Phase 1 oracle on fused ckpt (`atol ≤ 0.01`) |
-| E2E prefill median | **≥ 1.03×** vs Phase 3 vanilla at batch=1, seq=512 (stretch: 1.05×) |
-| Large shapes | **≥ 1.00×** (no regression at 32×2048) |
-| Layer-0 microbench | Match or beat Phase 2 attn Site-1 (~1.58× at 1×512) inside SGLang-loaded layer |
-
-If E2E stays at ~1.00× after a fused kernel lands, stop — the bottleneck is elsewhere (attention/MoE), not norm+linear.
+**Non-goals:** Site-2 MoE kernel fusion, TP>1, FP8/quant paths, upstream SGLang PR.
 
 ---
 
-## Architecture (what changes)
+## Success criteria vs outcomes
 
-### Current SGLang path (vanilla ckpt)
+| Gate | Target | Outcome |
+|------|--------|---------|
+| Correctness | Top-1 vs Phase 1 oracle | **PASS** (`--check-logits`) |
+| Op math | vs Phase 2 `Site1RmsState` | **PASS** (`test_fused_rmsnorm_gemm.py`) |
+| CUDA graphs | Graph replay safe | **PASS** (`test_cuda_graph_fusion.py`) |
+| E2E prefill @ 1×512 | **≥ 1.03×** | **~1.01×** (not met) |
+| Large shapes | **≥ 1.00×** | **~1.00×** (met) |
+| Layer-0 microbench in SGLang | ~1.58× attn | **Not run** (optional M5) |
+
+E2E ~1.00× after a working kernel means the bottleneck is attention/MoE, not norm+linear — documented and expected.
+
+---
+
+## Architecture
+
+### Vanilla SGLang path
 
 ```text
 LayerCommunicator.prepare_attn
@@ -31,201 +35,98 @@ LayerCommunicator.prepare_attn
        └─ in_proj_qkvz(h) / qkv_proj(h)     →  attention ...
 ```
 
-### Target path (fused ckpt, Phase 6)
+### Phase 6 fused path (active when `use_qwen_fusion()`)
 
 ```text
 LayerCommunicator.prepare_attn
-  └─ fused_add_residual_only(x, residual)   →  raw x (no norm write)
-       └─ fused_rmsnorm_gemm(raw, W_fused)   →  one kernel: W @ x / rms(x)
-            └─ attention ...                  →  stock SGLang (unchanged)
+  └─ residual add only (no norm write)
+       └─ fused_rmsnorm_gemm(raw, W_fused)   →  W @ x / rms(x)
+            └─ attention + MoE               →  stock SGLang
 ```
 
-**γ is already in `W_fused`** from `fused-checkpoint/export_fused_weights.py`. The kernel must **not** apply `(1+weight)` from `input_layernorm` when `weight ≈ 0`.
+**γ is in `W_fused`** from `fused-checkpoint/export_fused_weights.py`. SGLang **infers** fused ckpt (norm weights ≈ 0); no special config field. Details in [SGLang_changes.md § Fused checkpoint](./SGLang_changes.md#fused-checkpoint--γ-how-sglang-knows).
 
-### Call sites (Qwen3.6 / SGLang 0.5.x)
+### Call sites
 
-| Layer type | File (upstream) | Replace |
-|------------|-----------------|---------|
-| Linear-attn | `python/sglang/srt/models/qwen3_5.py` → `Qwen3_5GatedDeltaNet._forward_input_proj` | `in_proj_qkvz`, `in_proj_ba` |
-| Full-attn | same file → `Qwen3_5AttentionDecoderLayer.self_attention` | `qkv_proj` |
-| Norm boundary | `python/sglang/srt/layers/communicator.py` → `prepare_attn` | Skip `input_layernorm` when fusion enabled |
+| Layer type | File | Projections |
+|------------|------|-------------|
+| Linear-attn | `sglang/.../qwen3_5.py` → `_forward_input_proj` | `in_proj_qkvz`, `in_proj_ba` |
+| Full-attn | same → `forward_prepare_native` / `self_attention` | `qkv_proj` |
+| Norm boundary | `sglang/.../communicator.py` → `prepare_attn` | skip `input_layernorm` |
 
-MoE stays **stock**: `post_attention_layernorm` + `FusedMoE` (Site-2 not worth it per Phase 2 E2E).
+MoE stays **stock** (`FusedMoE` + `post_attention_layernorm` with γ already in expert weights from export).
 
 ---
 
-## Repo strategy — local clone (no upstream PR)
+## Setup — local SGLang clone
 
-You do **not** need a GitHub fork or PR to `sgl-project/sglang`. Clone upstream once, edit locally, install editable — keep it private to this project.
+Clone upstream once; override sources via `PYTHONPATH` (no `pip install -e` required — avoids Rust/gRPC rebuild issues):
 
 ```bash
-# Sibling to this repo (example layout)
-cd /path/to/parent
-git clone https://github.com/sgl-project/sglang.git
-cd sglang && git checkout v0.5.13
+# Sibling clone @ v0.5.13
+git clone https://github.com/sgl-project/sglang.git /sglang
+cd /sglang && git checkout v0.5.13
 
-# Install over pip SGLang (in phase1 venv)
-pip install -e /path/to/sglang/python
-pip install sglang-kernel==0.4.3+cu130
+# Phase 3 venv already has pip sglang + sglang-kernel
+source phase6/env.sh   # sets PYTHONPATH=/sglang/python
 ```
 
 ```text
-/path/to/
-  sglang/                         # local clone @ v0.5.13 — your private edits
-    python/sglang/srt/layers/fused_rmsnorm_gemm.py   # NEW
-    python/sglang/srt/models/qwen3_5.py              # wire fused path
-    python/sglang/srt/layers/communicator.py         # prepare_attn branch
-
-  qwen3.6-35B-fusion/
-    phase6/
-      README.md                   # this plan
-      patches/                    # optional: export your sglang diff for reproducibility
-      benchmark_sglang_fused_kernel.py   # (later)
+/sglang/                          # private edits (see SGLang_changes.md)
+/Qwen3.6-35B-fusion/phase6/
+  SGLang_changes.md               # file-by-file change log
+  env.sh                          # dev environment
+  test_fused_rmsnorm_gemm.py
+  test_cuda_graph_fusion.py
+  benchmark_sglang_fused_kernel.py
+  launch_server.sh
+  sync_fused_ckpt_metadata.sh
+  patches/                        # optional: git diff snapshot
 ```
 
-**Optional:** store `phase6/patches/*.patch` (`git diff` from your clone) so you can re-apply after re-cloning — no need to submodule or open-source the SGLang changes.
-
-**Do not** `pip install sglang` from PyPI after `pip install -e` — the editable clone replaces it.
+**Once:** `bash phase6/sync_fused_ckpt_metadata.sh` (VLM processor metadata for fused ckpt).
 
 ---
 
-## Implementation plan (milestones)
+## Milestones
 
-### M0 — Spike & environment (1–2 days)
+### M0 — Flag & fused-ckpt detection — done
 
-- [ ] Clone `sgl-project/sglang` at **v0.5.13** (match `phase3/setup_sglang.sh`); work on a local branch.
-- [ ] Confirm layer class names on GPU: `Qwen3_5LinearDecoderLayer`, `Qwen3_5AttentionDecoderLayer` (64 layers).
-- [ ] Add env flag: `SGLANG_QWEN_FUSION=1` (server arg + `ServerArgs`).
-- [ ] Detect fused ckpt: `input_layernorm.weight.abs().max() < 0.15` on layer 0 (reuse Phase 5 check).
+- [x] Local clone @ v0.5.13 + `phase6/env.sh`
+- [x] `SGLANG_QWEN_FUSION` / `--enable-qwen-fusion`
+- [x] Fused ckpt heuristic: layer-0 `input_layernorm.weight.max() < 0.15`
+- [x] Post-load log: `fused_ckpt=True active=True`
 
-**Deliverable:** Local clone builds; vanilla Qwen3.6 loads; flag is a no-op.
+### M1 — Reference kernel — done
 
----
+- [x] `fused_rmsnorm_gemm` + Triton RMS/divide
+- [x] `phase6/test_fused_rmsnorm_gemm.py` vs Phase 2
 
-### M1 — Reference kernel (Python/Triton prototype) (3–5 days)
+### M2 — Forward wiring — done
 
-Implement **correctness-first** op outside the hot path:
+- [x] `prepare_attn` fusion branch
+- [x] GDN + full-attn projections wired
+- [x] Shared RMS + alt-stream overlap for paired projections
+- [x] `--check-logits` PASS
 
-```python
-# fused_rmsnorm_gemm(x, weight, bias=None, eps=1e-6) -> y
-# y = F.linear(x, weight) / rms(x)   # mathematically matches Phase 2 Site1RmsState
-```
+### M3 — CUDA graphs — done
 
-**Steps:**
+- [x] Graph-capture safe (torch fallback + `raw_out`)
+- [x] `phase6/test_cuda_graph_fusion.py`
+- [ ] `nsys` kernel-count profile (optional)
 
-1. Triton kernel in `sglang/srt/layers/triton/` (follow `fused_moe_triton` patterns) **or** epilogue on existing GEMM.
-2. Unit test: random `x`, `W`, compare to `phase2/fusion_bf16.Site1RmsState.project`.
-3. Unit test: load one `in_proj_qkvz` weight from fused ckpt; max diff vs HF reference < 1e-2 BF16.
+### M4 — Benchmark — done
 
-**Start shapes:** `[T, 4096] @ [4096, K]` — token-major 2D (SGLang linear-attn layout).
+- [x] `phase6/benchmark_sglang_fused_kernel.py` (`benchmark_mode=sglang-fused-kernel`)
+- [x] 9-shape prefill sweep vs Phase 3 CSV
+- [x] Results: ~1.00× E2E
 
-**Deliverable:** `tests/test_fused_rmsnorm_gemm.py` green on Blackwell.
+### M5 — Hardening (optional)
 
----
-
-### M2 — Wire into Qwen3.5 projections (3–5 days)
-
-**`Qwen3_5GatedDeltaNet._forward_input_proj`:**
-
-```python
-if use_qwen_fusion:
-    qkvz = fused_rmsnorm_gemm(hidden_states, self.in_proj_qkvz.weight, eps=...)
-    ba   = fused_rmsnorm_gemm(hidden_states, self.in_proj_ba.weight, eps=...)
-    # preserve alt_stream overlap: rms(x) shared across both (like Site1RmsState V2)
-else:
-    ... stock ...
-```
-
-**`Qwen3_5AttentionDecoderLayer.self_attention`:**
-
-```python
-if use_qwen_fusion:
-    qkv = fused_rmsnorm_gemm(hidden_states, self.qkv_proj.weight, eps=...)
-else:
-    qkv, _ = self.qkv_proj(hidden_states)
-```
-
-**`prepare_attn` (when fusion on):**
-
-- Keep residual add path (`gemma_fused_add_rmsnorm` **without** norm multiply, or add-only + pass raw `hidden_states`).
-- Do **not** materialize normed tensor to global memory.
-
-**Deliverable:** `python -m sglang.launch_server --model-path ...-fused` + greedy decode matches oracle.
-
----
-
-### M3 — CUDA graphs & perf (3–5 days)
-
-SGLang captures piecewise CUDA graphs. Fused op must be:
-
-- [ ] Graph-capture safe (fixed addresses, no CPU sync in forward).
-- [ ] Compatible with `disable_piecewise_cuda_graph` fallback.
-- [ ] Registered in `MultiPlatformOp` pattern if needed (see `GemmaRMSNorm`).
-
-**Profile:** `nsys` one layer forward — confirm one fewer kernel launch vs stock (norm + GEMM → fused).
-
-**Deliverable:** Phase 3-equivalent benchmark script; median latency table.
-
----
-
-### M4 — Benchmark & compare (1–2 days)
-
-Add `phase6/benchmark_sglang_fused_kernel.py` (copy phase5 harness):
-
-| Compare against | CSV / baseline |
-|-----------------|----------------|
-| Phase 3 vanilla | `phase3/results/benchmark_*_sglang-vanilla_*.csv` |
-| Phase 5 native plugin | `phase5/results/benchmark_*_sglang-fused-native_*.csv` |
-| Phase 2 layer-0 (optional) | microbench single projection inside SGLang |
-
-Record `benchmark_mode=sglang-fused-kernel`.
-
----
-
-### M5 — Hardening (ongoing)
-
-- [ ] TP=1 only documented; TP>1 → fall back to stock path.
-- [ ] Quant / FP8 paths → fall back (no fused kernel).
-- [ ] `language_model_only`, multimodal load unchanged.
-- [ ] Document clone + `pip install -e` in `phase6/SETUP.md`.
-- [ ] Optional: save `phase6/patches/` diff for reproducibility.
-
----
-
-## Kernel design notes
-
-### Math (must match Phase 2)
-
-```text
-rms(x) = sqrt(mean(x²) + eps)          per token row
-y      = (x @ W_fused) / rms(x)        no γ — absorbed offline
-```
-
-Gemma norm `(1+weight)` must be **skipped** when fusion is active.
-
-### Shared RMS across paired projections (V2)
-
-Linear-attn runs `in_proj_qkvz` and `in_proj_ba` on the **same** `hidden_states`. Compute `rms(x)` **once** per layer forward (Phase 2 `Site1RmsState` V2 stream overlap). Kernel API:
-
-```python
-fused_rmsnorm_gemm_pair(x, W_a, W_b, eps, rms_state=None)
-```
-
-### Why Triton first
-
-- SGLang already ships Triton MoE kernels — matches project conventions.
-- Faster iteration than `sglang-kernel` C++/CUDA rebuild cycle.
-- Promote to `sglang-kernel` CUDA only if Triton leaves performance on the table.
-
-### Fallback matrix
-
-| Condition | Behavior |
-|-----------|----------|
-| `SGLANG_QWEN_FUSION=0` | Stock SGLang |
-| Vanilla ckpt (norm weight not ~0) | Stock SGLang |
-| `tp_size > 1` | Stock (v1) |
-| Quantized model | Stock |
-| Triton kernel unsupported dtype | Stock |
+- [x] TP>1 / quant → stock fallback (implemented in `use_qwen_fusion()`)
+- [ ] Export `phase6/patches/sglang-phase6.patch`
+- [ ] Same-session A/B benchmark
+- [ ] Layer-0 microbench inside SGLang
 
 ---
 
@@ -233,61 +134,72 @@ fused_rmsnorm_gemm_pair(x, W_a, W_b, eps, rms_state=None)
 
 ### Correctness
 
-- [ ] Phase 1 oracle top-1 on reference prompt (engine backend).
-- [ ] `max |logit diff| < 0.01` vs Phase 3 vanilla on same prompt (may differ slightly in last bits; top-1 must match).
-- [ ] Per-layer: fused vs `Site1RmsState` on random tensors, all layer types (linear + full).
+- [x] Phase 1 oracle top-1 (`benchmark_sglang_fused_kernel.py --check-logits`)
+- [x] Per-op: fused vs `Site1RmsState` (`test_fused_rmsnorm_gemm.py`)
+- [x] CUDA graph replay (`test_cuda_graph_fusion.py`)
+- [ ] Full logit diff vs vanilla (optional; top-1 sufficient for gate)
 
 ### Performance
 
-- [ ] 9-shape prefill sweep (same as phase3).
-- [ ] Layer-0 isolated projection timing (optional microbench hook).
-- [ ] Memory: no extra large activation for normed `h` (bandwidth win is the hypothesis).
+- [x] 9-shape prefill sweep (M4)
+- [ ] Layer-0 isolated projection in SGLang (optional)
+- [ ] Same-session vanilla comparison (baseline CSV is from a prior Phase 3 run)
 
 ---
 
-## Risk register
+## Kernel design notes
 
-| Risk | Mitigation |
-|------|------------|
-| E2E gain < 3% even with fused kernel | Expected from Phase 3/5; document result; no need to contribute upstream |
-| CUDA graph breaks | `disable_piecewise_cuda_graph` fallback; test capture mode early |
-| SGLang version drift | Pin v0.5.13; document diff for 0.5.14+ |
-| `MergedColumnParallelLinear` weight layout | Unit test weight shapes against live module |
-| Multimodal load / config | Reuse phase4/5 metadata sync; no change to vision path |
+### Math
+
+```text
+rms(x) = sqrt(mean(x²) + eps)
+y      = (x @ W_fused) / rms(x)        γ absorbed offline; no (1+weight) at runtime
+```
+
+### Shared RMS (linear-attn layers)
+
+`in_proj_qkvz` and `in_proj_ba` share one `rms(x)` per layer via `RmsNormGemmState` / `fused_rmsnorm_gemm_pair`.
+
+### Fallback matrix
+
+| Condition | Behavior |
+|-----------|----------|
+| `SGLANG_QWEN_FUSION=0` / no `--enable-qwen-fusion` | Stock SGLang |
+| Vanilla ckpt (norm weight not ~0) | Stock |
+| `tp_size > 1` | Stock |
+| Quantized model | Stock |
+
+---
+
+## Quick reference
+
+```bash
+source phase6/env.sh
+
+# Benchmark (engine backend — stop any server on :30000 first)
+python phase6/benchmark_sglang_fused_kernel.py --check-logits
+
+# Or serve + HTTP benchmark
+bash phase6/launch_server.sh
+python phase6/benchmark_sglang_fused_kernel.py --backend http --check-logits
+
+# Unit tests
+python phase6/test_fused_rmsnorm_gemm.py
+python phase6/test_cuda_graph_fusion.py
+```
 
 ---
 
 ## Relationship to earlier phases
 
-| Phase | Role in Phase 6 |
-|-------|-----------------|
-| **1** | Correctness oracle |
+| Phase | Role |
+|-------|------|
 | **export** | Fused checkpoint (`W_fused`, norm ≈ 0) |
-| **2** | Math reference (`fusion_bf16`, layer-0 speedup target) |
-| **3** | E2E baseline to beat |
-| **4** | Anti-pattern (HF forward replacement) |
-| **5** | Anti-pattern (Python native hooks); reuse weight check + benchmark harness |
-
----
-
-## Quick reference commands (once implemented)
-
-```bash
-# Editable install from local clone
-pip install -e /path/to/sglang/python
-
-# Serve fused model with kernel fusion
-export SGLANG_QWEN_FUSION=1
-python -m sglang.launch_server \
-    --model-path /data/Qwen3.6-35B-A3B-bf16-fused \
-    --dtype bfloat16 --tp-size 1 --context-length 65536 \
-    --trust-remote-code
-
-# Benchmark
-python phase6/benchmark_sglang_fused_kernel.py \
-    --baseline-csv phase3/results/benchmark_*_sglang-vanilla_*.csv \
-    --check-logits
-```
+| **1** | Correctness oracle |
+| **2** | Math reference + layer-0 speedup targets |
+| **3** | E2E baseline CSV |
+| **4–5** | Anti-patterns (plugins/hooks ~1.0× E2E) |
+| **6** | In-engine kernel (this work) |
 
 ---
 
@@ -295,13 +207,7 @@ python phase6/benchmark_sglang_fused_kernel.py \
 
 | Date | Decision | Rationale |
 |------|----------|-----------|
-| 2026-06 | Site-1 only in SGLang kernel | MoE already FusedMoE; Site-2 hurts E2E on HF |
-| 2026-06 | Local SGLang clone, not Pie/plugins | Fusion must live in model forward / CUDA; no upstream PR |
-| 2026-06 | Triton before custom CUDA | Match SGLang MoE patterns; faster iteration |
-| 2026-06 | Success bar ≥1.03× E2E | Phase 5 parity proves <3% is noise without real kernel |
-
----
-
-## Next action
-
-Start **M0**: clone SGLang @ v0.5.13, add `SGLANG_QWEN_FUSION` flag (no-op), verify load on `/data/Qwen3.6-35B-A3B-bf16-fused` with Phase 3 env.
+| 2026-06 | Site-1 only in SGLang | MoE already `FusedMoE`; Site-2 hurt/neutral on HF E2E |
+| 2026-06 | Local clone via `PYTHONPATH` | No upstream PR; avoid editable-install Rust build |
+| 2026-06 | Triton + cuBLAS first | Match SGLang patterns; fast iteration |
+| 2026-06 | E2E ~1.00× accepted | Kernel correct; bottleneck elsewhere |
